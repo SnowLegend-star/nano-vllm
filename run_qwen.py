@@ -7,8 +7,8 @@ llm = LLM(
     enforce_eager=True,        # 1650 上更稳
     tensor_parallel_size=1,
     dtype="float16",           # 降显存
-    gpu_memory_utilization = 0.8,
-    max_model_len=1024,
+    gpu_memory_utilization = 0.85,
+    max_model_len=256,
 )
 
 sampling_params = SamplingParams(

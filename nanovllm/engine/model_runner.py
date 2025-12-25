@@ -97,19 +97,89 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
+    # def allocate_kv_cache(self):
+    #     config = self.config
+    #     hf_config = config.hf_config
+    #     free, total = torch.cuda.mem_get_info()
+    #     used = total - free
+    #     peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+    #     current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    #     num_kv_heads = hf_config.num_key_value_heads // self.world_size
+    #     head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+    #     block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+    #     config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+    #     assert config.num_kvcache_blocks > 0
+    #     self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+    #     layer_id = 0
+    #     for module in self.model.modules():
+    #         if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+    #             module.k_cache = self.kv_cache[0, layer_id]
+    #             module.v_cache = self.kv_cache[1, layer_id]
+    #             layer_id += 1
+        
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        
+        # --- 1. 获取显存信息 ---
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        
+        # 获取 PyTorch 内部统计
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        
+        # 计算 KV Cache 的维度
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        
+        # 计算一个 Block 需要多少字节
+        # 注意：这里我们假设之后创建 Cache 使用与模型相同的 dtype (float16)，所以显存计算更精准
+        dtype_size = hf_config.torch_dtype.itemsize 
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype_size
+        
+        # --- 2. 打印调试信息 (看看显存到底去哪了) ---
+        print(f"\n[KV Alloc Debug] Total: {total/1024**2:.2f}MB, Free: {free/1024**2:.2f}MB")
+        print(f"[KV Alloc Debug] Used (Sys+Weight): {used/1024**2:.2f}MB")
+        print(f"[KV Alloc Debug] Peak-Current (Fragmentation): {(peak-current)/1024**2:.2f}MB")
+        
+        # --- 3. 计算可用显存 (关键修改) ---
+        # 原始公式：available = total * util - used - (peak - current)
+        # 现在的策略：如果 (peak - current) 太大导致结果为负，我们忽略它，因为我们真的没有余地了。
+        
+        budget = total * config.gpu_memory_utilization
+        available_bytes = budget - used - (peak - current)
+        
+        print(f"[KV Alloc Debug] Calculated Budget for KV: {available_bytes/1024**2:.2f}MB")
+
+        config.num_kvcache_blocks = int(available_bytes) // block_bytes
+
+        # --- 4. 暴力兜底逻辑 (专治 4GB 显卡) ---
+        if config.num_kvcache_blocks <= 0:
+            fallback_blocks = 50  # 强制分配 50 个块 (约 800 token)
+            print(f"[WARNING] Auto-profiling failed (Blocks={config.num_kvcache_blocks}).")
+            print(f"[WARNING] Forcing num_kvcache_blocks = {fallback_blocks} manually to bypass OOM check.")
+            config.num_kvcache_blocks = fallback_blocks
+        else:
+            print(f"[KV Alloc Debug] Successfully allocated {config.num_kvcache_blocks} blocks.")
+
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        # --- 5. 创建 KV Cache Tensor (关键优化) ---
+        # 增加 dtype=hf_config.torch_dtype，强制使用 float16。
+        # 原代码没有加 dtype，默认是 float32，显存占用会翻倍！
+        self.kv_cache = torch.empty(
+            2, 
+            hf_config.num_hidden_layers, 
+            config.num_kvcache_blocks, 
+            self.block_size, 
+            num_kv_heads, 
+            head_dim,
+            dtype=hf_config.torch_dtype,  # <--- 必须加这个，省一半显存
+            device="cuda"                 # <--- 显式指定设备
+        )
+        
+        # 指针绑定
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
