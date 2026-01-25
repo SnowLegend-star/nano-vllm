@@ -8,16 +8,19 @@ llm = LLM(
     tensor_parallel_size=1,
     dtype="float16",           # 降显存
     gpu_memory_utilization = 0.85,
-    max_model_len=256,
+    max_model_len=500,
 )
 
 sampling_params = SamplingParams(
     temperature=0.6,
-    max_tokens=64,            # 先别太大
+    max_tokens=200,            # 先别太大
 )
 
 prompts = [
-    "Hello! Please briefly introduce yourself."
+    # "Hello! Please briefly introduce yourself.",
+    # "今天是圣诞节,圣诞快乐!",
+    # "Merry Christmas!",
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n我喜欢你。<|im_end|>\n<|im_start|>assistant\n"
 ]
 
 outputs = llm.generate(prompts, sampling_params)

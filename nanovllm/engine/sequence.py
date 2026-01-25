@@ -16,7 +16,7 @@ class Sequence:
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
-        self.seq_id = next(Sequence.counter)
+        self.seq_id = next(Sequence.counter)    # 我们预热的时候跑了一次max_seq，所以这里seq_id是32
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
@@ -56,6 +56,7 @@ class Sequence:
 
     @property
     def num_blocks(self):
+        '''向上取整'''
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
@@ -63,6 +64,7 @@ class Sequence:
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):
+        '''获取第 i 个块的 token ID 列表'''
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
 

@@ -392,7 +392,7 @@ def naive_attention_prefill(q, k, v, scale, num_heads, num_kv_heads, context):
 # ------------------------------------------------------------
 def naive_attention_decode(q, k_cache, v_cache, scale, num_heads, num_kv_heads, context):
     """
-    Decode 阶段：正确地从 Block Table 读取历史 KV，解决乱码问题。
+    Decode 阶段：正确地从 Block Table 读取历史 KV,解决乱码问题。
     """
     B = q.shape[0]
     

@@ -15,19 +15,22 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        # 步骤1：获取Config类的所有字段名（比如enforce_eager、dtype、max_model_len等）
         config_fields = {field.name for field in fields(Config)}
+        # 步骤2：从kwargs中筛选出「仅属于Config类的参数」，过滤无关参数
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        # 步骤3：用筛选后的参数实例化Config配置类，统一管理配置
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
+        ctx = mp.get_context("spawn")  # 获取spawn模式的多进程上下文
         for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
+            event = ctx.Event()  # 创建spawn上下文的跨进程事件（用于进程同步）
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))  # 创建子进程
+            process.start()  # 启动子进程（运行ModelRunner，对应rank=i的GPU）
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.events)  # 主进程运行rank=0的ModelRunner
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
@@ -65,7 +68,7 @@ class LLMEngine:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(prompts)
+            sampling_params = [sampling_params] * len(prompts)  # 令采样配置与Seq长度一直
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
