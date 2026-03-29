@@ -123,7 +123,7 @@ class ModelRunner:
         # 步骤5：执行一次完整的推理（预热核心操作）
         # self.run(seqs, True)：调用推理核心方法，True标记为“预热模式”；
         # 作用：触发GPU侧所有一次性初始化操作（见下文详解）
-        self.run(seqs, True)
+        self.run(seqs, "prefill")
 
         # 步骤6：再次清空缓存（核心：释放预热过程中临时分配的无用显存，为正式推理预留空间）
         torch.cuda.empty_cache()
@@ -218,11 +218,11 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, block_tables: list[list[int]]):
         # 步骤1：获取批量中block_table的最大长度
-        max_len = max(len(seq.block_table) for seq in seqs)
+        max_len = max(len(block_table) for block_table in block_tables)
         # 步骤2：用-1填充，统一所有block_table的长度
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = [block_table + [-1] * (max_len - len(block_table)) for block_table in block_tables]
         # 步骤3：转换为GPU张量（带1650适配优化）
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         # 步骤4：返回标准化后的张量
@@ -277,12 +277,53 @@ class ModelRunner:
                 # 收集当前块的所有slot索引（每个token对应一个slot）
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+            block_tables = self.prepare_block_tables([seq.block_table for seq in seqs])
         # 将所有收集的列表转成CUDA张量，适配模型推理
         # 关键参数：
         # - dtype：匹配模型要求（int64/int32）；
         # - pin_memory=True：锁页内存，加速CPU→GPU传输（避免内存换页）；
         # - cuda(non_blocking=True)：非阻塞式传输，CPU可继续执行其他逻辑，提升并行性；
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        return input_ids, positions
+
+    def prepare_recompute(self, seqs: list[Sequence]):
+        input_ids = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping = []
+        block_tables = None
+        recompute_tables = []
+        use_prefix_cache = False
+        for seq in seqs:
+            block_ids = seq.pending_recompute_block_ids
+            assert seq.recompute_pending and block_ids
+            start_block = seq.recompute_start_block
+            end_block = start_block + len(block_ids)
+            start_token = start_block * self.block_size
+            end_token = end_block * self.block_size
+            input_ids.extend(seq.token_ids[start_token:end_token])
+            positions.extend(range(start_token, end_token))
+            seqlen_q = end_token - start_token
+            seqlen_k = end_token
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+            for block_id in block_ids:
+                start = block_id * self.block_size
+                slot_mapping.extend(range(start, start + self.block_size))
+            recompute_tables.append(seq.prefix_block_table + block_ids)
+            use_prefix_cache = use_prefix_cache or bool(seq.prefix_block_table)
+        if use_prefix_cache:
+            block_tables = self.prepare_block_tables(recompute_tables)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -297,6 +338,7 @@ class ModelRunner:
         slot_mapping = []    # 存储每个序列最后一个 Token 在 KV 缓存中的「绝对槽位索引」
         context_lens = []    # 存储每个序列的「总长度」
         for seq in seqs:
+            assert not seq.recompute_pending
             input_ids.append(seq.last_token)  # 步骤1：取最后一个 Token ID
             positions.append(len(seq) - 1)    # 步骤2：取最后一个 Token 的位置（从0开始计数）
             context_lens.append(len(seq))     # 步骤3：取序列总长度
@@ -310,7 +352,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         # 转换 context_lens：序列长度用 int32，省显存；同优化
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables([seq.block_table for seq in seqs])
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -322,10 +364,10 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode() # 禁用所有梯度计算、张量设为只读
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_hidden_states(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             # Prefill 阶段序列长度 / 批次变化大，编译图复用率低，Eager 模式更灵活
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return self.model(input_ids, positions)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -339,12 +381,24 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return graph_vars["outputs"][:bs]
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    @torch.inference_mode()
+    def run_recompute(self, seqs: list[Sequence]):
+        input_ids, positions = self.prepare_recompute(seqs)
+        self.run_hidden_states(input_ids, positions, True)
+        reset_context()
+        return None
+
+    @torch.inference_mode()
+    def run(self, seqs: list[Sequence], mode: str):
+        if mode == "recompute":
+            return self.run_recompute(seqs)
+        is_prefill = mode == "prefill"
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        hidden_states = self.run_hidden_states(input_ids, positions, is_prefill)
+        logits = self.model.compute_logits(hidden_states)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

@@ -67,6 +67,7 @@ class BlockManager:
     def allocate(self, seq: Sequence):
         # 断言：分配前序列的块表必须为空（防止重复分配，保证逻辑安全）
         assert not seq.block_table
+        assert not seq.prefix_block_table
         h = -1
         cache_miss = False
 
@@ -113,14 +114,67 @@ class BlockManager:
             # 7. 记录该块ID到序列的块表（序列和块绑定）
             seq.block_table.append(block_id)
 
-    def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table):
+    def _release_block_ids(self, block_ids: list[int]):
+        for block_id in reversed(block_ids):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
+
+    def deallocate(self, seq: Sequence):
+        self._release_block_ids(seq.pending_recompute_block_ids)
+        self._release_block_ids(seq.block_table)
+        self._release_block_ids(seq.prefix_block_table)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.clear_recompute_state()
+
+    def evict_prefix(self, seq: Sequence, keep_last_blocks: int) -> int:
+        if seq.recompute_pending:
+            return 0
+        evict_blocks = max(0, len(seq.block_table) - keep_last_blocks)
+        if evict_blocks == 0:
+            return 0
+        evicted_block_ids = seq.block_table[:evict_blocks]
+        self._release_block_ids(evicted_block_ids)
+        seq.block_table = seq.block_table[evict_blocks:]
+        seq.mark_recompute(evict_blocks)
+        return evict_blocks
+
+    def can_restore_prefix(self, seq: Sequence, num_blocks: int) -> bool:
+        return seq.recompute_pending and num_blocks > 0 and len(self.free_block_ids) >= num_blocks
+
+    def reserve_prefix_restore_blocks(self, seq: Sequence, num_blocks: int) -> list[int]:
+        assert self.can_restore_prefix(seq, num_blocks)
+        assert not seq.pending_recompute_block_ids
+        block_ids = []
+        for _ in range(num_blocks):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_ids.append(block_id)
+        seq.pending_recompute_block_ids = block_ids
+        return block_ids
+
+    def commit_prefix_restore(self, seq: Sequence):
+        block_ids = seq.pending_recompute_block_ids
+        assert block_ids
+        start_block = seq.recompute_start_block
+        prefix_hash = self.blocks[seq.prefix_block_table[-1]].hash if seq.prefix_block_table else -1
+        for offset, block_id in enumerate(block_ids):
+            logical_block_id = start_block + offset
+            token_ids = seq.block(logical_block_id)
+            block = self.blocks[block_id]
+            h = self.compute_hash(token_ids, prefix_hash)
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block_id
+            seq.prefix_block_table.append(block_id)
+            prefix_hash = h
+        seq.pending_recompute_block_ids = []
+        seq.evicted_prefix_blocks -= len(block_ids)
+        assert seq.evicted_prefix_blocks >= 0
+        if seq.evicted_prefix_blocks == 0:
+            seq.block_table = seq.prefix_block_table + seq.block_table
+            seq.clear_recompute_state()
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)

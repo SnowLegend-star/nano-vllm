@@ -8,9 +8,12 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
+        Sequence.block_size = config.kvcache_block_size
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.keep_last_blocks = config.kvcache_keep_last_blocks
+        self.recompute_chunk_blocks = config.kvcache_recompute_chunk_blocks
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -19,9 +22,10 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        seq.keep_last_blocks = self.keep_last_blocks
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> tuple[list[Sequence], str]:
         # Prefill阶段：调度新请求（waiting队列）
         scheduled_seqs = []
         num_seqs = 0
@@ -43,39 +47,95 @@ class Scheduler:
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
-            return scheduled_seqs, True
+            return scheduled_seqs, "prefill"
+
+        scheduled_seqs = self.schedule_recompute()
+        if scheduled_seqs:
+            return scheduled_seqs, "recompute"
 
         # Decode阶段：调度正在运行的请求（running队列）
-        # 循环条件：有运行中的序列 + 已调度数未达上限
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            # 循环检查：当前序列是否能追加新token（资源是否足够）
+        running = list(self.running)
+        self.running.clear()
+        kept = []
+        while running and num_seqs < self.max_num_seqs:
+            seq = running.pop(0)
+            if seq.recompute_pending:
+                kept.append(seq)
+                continue
             while not self.block_manager.can_append(seq):
-                if self.running:
-                    # 优先抢占运行队列最后一个序列（回收其块）
-                    self.preempt(self.running.pop())
-                else:
-                    # 无其他序列可抢占 → 抢占当前序列，退出检查
-                    self.preempt(seq)
+                victim = self._take_victim(running, kept, seq)
+                if victim is None:
+                    if self.evict_or_preempt(seq):
+                        kept.append(seq)
+                    seq = None
                     break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq) # 为追加token预留块资源
-                scheduled_seqs.append(seq)
-        # 断言：Decode阶段必须调度到至少一个序列（否则程序逻辑异常）
+                if self.evict_or_preempt(victim):
+                    kept.append(victim)
+            if seq is None:
+                continue
+            num_seqs += 1
+            self.block_manager.may_append(seq)
+            seq.status = SequenceStatus.RUNNING
+            scheduled_seqs.append(seq)
+            kept.append(seq)
+        self.running.extend(kept)
+        self.running.extend(running)
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))   # 先翻转调度列表再添加
-        return scheduled_seqs, False
+        return scheduled_seqs, "decode"
+
+    def schedule_recompute(self) -> list[Sequence]:
+        pending = []
+        for seq in self.running:
+            if not seq.recompute_pending or seq.pending_recompute_block_ids:
+                continue
+            pending.append(seq)
+            num_blocks = min(self.recompute_chunk_blocks, seq.evicted_prefix_blocks)
+            if not self.block_manager.can_restore_prefix(seq, num_blocks):
+                continue
+            self.block_manager.reserve_prefix_restore_blocks(seq, num_blocks)
+            seq.status = SequenceStatus.RECOMPUTE
+            return [seq]
+        if pending:
+            seq = pending[-1]
+            self.running.remove(seq)
+            self.preempt(seq)
+        return []
+
+    def _take_victim(self, running: list[Sequence], kept: list[Sequence], exclude: Sequence):
+        for container in (running, kept):
+            for i in range(len(container) - 1, -1, -1):
+                seq = container[i]
+                if seq is exclude or seq.recompute_pending:
+                    continue
+                return container.pop(i)
+        return None
+
+    def evict_or_preempt(self, seq: Sequence) -> bool:
+        evicted = self.block_manager.evict_prefix(seq, seq.keep_last_blocks)
+        if evicted:
+            return True
+        self.preempt(seq)
+        return False
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess_decode(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)  
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+            else:
+                seq.status = SequenceStatus.RUNNING
+
+    def postprocess_recompute(self, seqs: list[Sequence]):
+        for seq in seqs:
+            self.block_manager.commit_prefix_restore(seq)
+            if seq.recompute_pending:
+                seq.status = SequenceStatus.RECOMPUTE
+            else:
+                seq.status = SequenceStatus.RUNNING

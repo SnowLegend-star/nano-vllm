@@ -49,11 +49,19 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
+        seqs, mode = self.scheduler.schedule()
+        token_ids = self.model_runner.call("run", seqs, mode)
+        if mode == "recompute":
+            self.scheduler.postprocess_recompute(seqs)
+        else:
+            self.scheduler.postprocess_decode(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        if mode == "prefill":
+            num_tokens = sum(len(seq) for seq in seqs)
+        elif mode == "decode":
+            num_tokens = -len(seqs)
+        else:
+            num_tokens = 0
         return outputs, num_tokens
 
     def is_finished(self):

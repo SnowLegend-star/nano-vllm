@@ -1,6 +1,6 @@
 from nanovllm import LLM, SamplingParams
 
-MODEL_PATH = "/home/linger2/huggingface/Qwen3-0.6B"
+MODEL_PATH = "./Model/Qwen3-0.6B"
 
 llm = LLM(
     MODEL_PATH,
