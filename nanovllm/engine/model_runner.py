@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.layers.attention import HAS_FLASH_ATTN
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -42,7 +43,16 @@ class ModelRunner:
 
         # 步骤5：性能优化（CUDA Graph捕获，非eager模式下启用）
         if not self.enforce_eager:
-            self.capture_cudagraph()  # 捕获CUDA图，提升Decode阶段吞吐量
+            if not HAS_FLASH_ATTN:
+                print("[WARNING] FlashAttention is unavailable, skipping CUDA Graph and falling back to eager mode.")
+                self.enforce_eager = True
+            else:
+                try:
+                    self.capture_cudagraph()  # 捕获CUDA图，提升Decode阶段吞吐量
+                except RuntimeError as exc:
+                    # 纯 PyTorch fallback 的 KV 写入包含动态图索引，在某些环境下无法被 CUDA Graph 捕获。
+                    print(f"[WARNING] CUDA Graph capture failed, falling back to eager mode: {exc}")
+                    self.enforce_eager = True
 
         # 步骤6：还原默认环境（避免影响其他逻辑）
         torch.set_default_device("cpu")
