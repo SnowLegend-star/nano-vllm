@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
+from nanovllm.utils.distributed import get_tp_rank,get_tp_world_size
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -11,8 +12,8 @@ class VocabParallelEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()  # 继承nn.Module的基础初始化
         # 步骤1：获取张量并行的核心标识（多卡场景）
-        self.tp_rank = dist.get_rank()  # 当前GPU的rank（0开始）
-        self.tp_size = dist.get_world_size()  # 张量并行的GPU总数
+        self.tp_rank = get_tp_rank()  # 当前GPU的rank（0开始）
+        self.tp_size = get_tp_world_size()  # 张量并行的GPU总数
 
         # 步骤2：校验词汇表可均分（并行的前提）
         assert num_embeddings % self.tp_size == 0, "词汇表大小必须能被GPU数整除"
@@ -78,7 +79,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias  # 核心约束：Qwen3等大模型的LMHead无偏置，避免错误配置
         super().__init__(num_embeddings, embedding_dim)  # 复用父类初始化逻辑
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, only_last_token: bool = True):
         # x：模型输出的隐藏状态，形状随阶段变化：
         # - Prefill阶段：[总token数, hidden_size]（比如两个序列，总长度100 → [100, 4096]）
         # - Decode阶段：[batch_size, hidden_size]（比如8个序列 → [8, 4096]）
@@ -87,7 +88,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
 
         # 步骤2：Prefill阶段优化——仅计算每个序列最后一个token的logits（核心！）
-        if context.is_prefill:
+        if context.is_prefill and only_last_token:
             # context.cu_seqlens_q：累积序列长度（如[0, 50, 100]，表示2个序列，长度50/50）
             # cu_seqlens_q[1:] -1 → 每个序列最后一个token的索引（如49、99）
             last_indices = context.cu_seqlens_q[1:] - 1

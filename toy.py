@@ -27,7 +27,9 @@ print(k_cache_flat.shape)  # torch.Size([64, 8, 128])
 # torch.arange()
 
 x=torch.tensor([[1,2],[3,4]]) 
-x=x.float()
-var=x.pow(2).mean(0,True)
-print(var)
+# x=x.float()
+# var=x.pow(2).mean(0,True)
+# print(var)
+
+print(x.tolist())
 

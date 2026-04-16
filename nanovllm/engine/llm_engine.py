@@ -34,13 +34,22 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._closed = False
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.call("exit")
+            del self.model_runner
+
+        for p in getattr(self, "ps", []):
+            if p.is_alive():
+                p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

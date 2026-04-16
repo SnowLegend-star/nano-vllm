@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.distributed import get_tp_world_size
 
 
 class Qwen3Attention(nn.Module):
@@ -26,7 +27,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size    # 本卡负责的Q head数
@@ -291,6 +292,7 @@ class Qwen3ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        only_last_token: bool = True,
     ) -> torch.Tensor:
         # 单独运行 LM Head，返回 Logits
-        return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states, only_last_token=only_last_token)

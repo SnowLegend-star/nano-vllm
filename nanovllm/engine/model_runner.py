@@ -25,8 +25,9 @@ class ModelRunner:
         self.rank = rank  # 当前进程/GPU的唯一标识
         self.event = event  # CUDA事件，用于异步同步/计时
 
+        if self.world_size > 1:
         # 步骤2：分布式环境初始化（多卡张量并行的基础）
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)  # 绑定当前进程到指定GPU
 
         # 步骤3：GPU推理环境配置（数据类型/设备）
@@ -78,7 +79,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if self.world_size > 1:
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -184,13 +186,14 @@ class ModelRunner:
         print(f"[KV Alloc Debug] Used (Sys+Weight): {used/1024**2:.2f}MB")
         print(f"[KV Alloc Debug] Peak-Current (Fragmentation): {(peak-current)/1024**2:.2f}MB")
         
-        # --- 3. 计算可用显存 (关键修改) ---
-        # 原始公式：available = total * util - used - (peak - current)
-        # 现在的策略：如果 (peak - current) 太大导致结果为负，我们忽略它，因为我们真的没有余地了。
-        
-        budget = total * config.gpu_memory_utilization
-        available_bytes = budget - used - (peak - current)
-        
+        # --- 3. 设置可用显存 ---
+        if config.kvcache_memory_budget is not None:
+            # 显式预算适合双模型场景，避免第二个模型把前一个模型占用也算成自己的负担
+            available_bytes = int(config.kvcache_memory_budget * 1024 * 1024 * 1024)
+        else:
+            budget = total * config.gpu_memory_utilization
+            available_bytes = budget - used - (peak - current)
+
         print(f"[KV Alloc Debug] Calculated Budget for KV: {available_bytes/1024**2:.2f}MB")
 
         config.num_kvcache_blocks = int(available_bytes) // block_bytes
@@ -375,6 +378,7 @@ class ModelRunner:
 
     @torch.inference_mode() # 禁用所有梯度计算、张量设为只读
     def run_hidden_states(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        '''判断是否需要启动cudaGraph'''
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             # Prefill 阶段序列长度 / 批次变化大，编译图复用率低，Eager 模式更灵活
             return self.model(input_ids, positions)
@@ -400,17 +404,92 @@ class ModelRunner:
         reset_context()
         return None
 
+
+    @torch.inference_mode()
+    def forward_hidden_state(self, seqs: list[Sequence], mode: str) -> torch.Tensor:
+        '''进行hidden_state的前向计算'''
+        is_prefill = mode == "prefill"
+        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs) 
+        hidden_states = self.run_hidden_states(input_ids, positions, is_prefill)
+        return hidden_states
+    
+    @torch.inference_mode()
+    def forward_logits(self,seqs: list[Sequence],mode:str) -> torch.Tensor:
+        '''进行logits的前向计算, 注意清理context'''
+        try:
+            hidden_states = self.forward_hidden_state(seqs, mode)
+            logits = self.model.compute_logits(hidden_states)
+            return logits
+        finally:
+            reset_context()
+
+    @torch.inference_mode()
+    def forward_verify_logits(
+        self,
+        seqs: list[Sequence],
+        mode: str,
+        num_logits_to_keep: int | None = None,
+    ) -> torch.Tensor:
+        """
+        verify 路径保留 prefill 的全部位置 logits。
+        当前主要用于单请求 speculative decoding，调用方自行决定如何切片和比对。
+        """
+        try:
+            hidden_states = self.forward_hidden_state(seqs, mode)
+            logits = self.model.compute_logits(hidden_states, only_last_token=False)
+            if num_logits_to_keep is not None:
+                logits = logits[-num_logits_to_keep:]
+            return logits
+        finally:
+            reset_context()
+
+    @torch.inference_mode()
+    def sample_from_logits(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        '''从logits中采样token, 只有rank0可以拿到完整的logits'''
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank==0 else None
+        return token_ids
+
+    @torch.inference_mode()
+    def verify_draft_tokens(
+        self,
+        draft_token_ids: list[int],
+        verify_logits: torch.Tensor,
+        include_bonus_token: bool = False,
+    ) -> tuple[int, list[int], int | None]:
+        """
+        仅负责比对 draft proposal 与 base verify logits，不直接修改外部 Sequence。
+        verify_logits 约定为单请求逐位置 logits，shape=[N, vocab_size]。
+        """
+        assert draft_token_ids
+        assert verify_logits.dim() == 2
+        required = len(draft_token_ids) + int(include_bonus_token)
+        assert verify_logits.size(0) >= required
+
+        base_token_ids = verify_logits.argmax(dim=-1).tolist()
+        accepted_count = 0
+        accepted_token_ids: list[int] = []
+        fallback_token_id = None
+
+        for idx, draft_token_id in enumerate(draft_token_ids):
+            base_token_id = base_token_ids[idx]
+            if draft_token_id != base_token_id:
+                fallback_token_id = base_token_id
+                return accepted_count, accepted_token_ids, fallback_token_id
+            accepted_count += 1
+            accepted_token_ids.append(draft_token_id)
+
+        if include_bonus_token and len(base_token_ids) > len(draft_token_ids):
+            fallback_token_id = base_token_ids[len(draft_token_ids)]
+        return accepted_count, accepted_token_ids, fallback_token_id
+
+
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], mode: str):
         if mode == "recompute":
             return self.run_recompute(seqs)
-        is_prefill = mode == "prefill"
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        logits = self.forward_logits(seqs, mode)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        hidden_states = self.run_hidden_states(input_ids, positions, is_prefill)
-        logits = self.model.compute_logits(hidden_states)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
+        token_ids = self.sample_from_logits(logits, temperatures)
         return token_ids
 
     @torch.inference_mode()
@@ -478,3 +557,4 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+

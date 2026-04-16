@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from nanovllm.utils.distributed import get_tp_rank,get_tp_world_size
 
 
 def divide(numerator, denominator):
@@ -25,8 +26,8 @@ class LinearBase(nn.Module):
         
         # 获取当前进程的 Rank（ID）和 World Size（总进程数/GPU数）
         # 这是分布式训练/推理的核心：知道“我是谁”以及“总共有多少人”
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_world_size()
         
         # 初始化权重参数
         # 关键点：这里的 input_size 和 output_size 通常已经是“分片后”的大小
@@ -73,7 +74,7 @@ class ReplicatedLinear(LinearBase):
 class ColumnParallelLinear(LinearBase):
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        tp_size = dist.get_world_size() # 获取总卡数 (例如 2)
+        tp_size = get_tp_world_size() # 获取总卡数 (例如 2)
         
         # 关键逻辑：
         # 1. input_size 保持不变 (因为每一列都需要完整的输入维度做点积)
@@ -158,7 +159,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None, # KV 的总头数 (GQA场景下可能只有 4 或 8)
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         
         # 1. 处理 GQA/MQA 逻辑
         # 如果没传 kv_heads，默认等于 num_heads (标准 Multi-Head Attention)
@@ -223,7 +224,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 class RowParallelLinear(LinearBase):
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         # 关键点 1: input_size 被除以 tp_size (切分输入维度)
         # 关键点 2: output_size 保持不变 (输出维度是完整的)
         # 关键点 3: tp_dim=1。PyTorch Linear权重形状是[out, in]，所以我们在第1维切分。
