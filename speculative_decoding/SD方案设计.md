@@ -343,6 +343,96 @@ def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
 5. 如果全部 accept：
    - 继续沿用当前 draft 状态，不重建
 
+### 3.1 当前 MVP 与未来高性能版时序图对比
+
+下面两张图分别描述：
+
+- 当前已经落地的 MVP：`draft proposal + base 逐 token verify + reject 后重建 draft`
+- 未来目标版本：`draft proposal + base 整段 verify + 尽量避免重建 draft`
+
+#### 当前 MVP 时序图
+
+这张图对应现在代码里的真实控制流。  
+最大特点是：**base 还是逐 token verify**，而且 **reject 后会直接重建 draft 状态**。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User Prompt
+    participant S as SpeculativeLLM
+    participant D as Draft Engine
+    participant B as Base Engine
+
+    U->>S: generate(prompt)
+    S->>D: 创建 draft Sequence 并 prefill prompt
+    S->>B: 创建 base Sequence 并 prefill prompt
+
+    loop 直到达到 max_tokens 或 eos
+        S->>D: 连续 proposal 最多 K 个 token
+        D-->>S: 返回 draft token 序列
+
+        loop 逐 token verify
+            S->>B: 基于当前真实前缀做一次 next-token logits
+            B-->>S: base_token
+
+            alt base_token == 当前 draft token
+                S->>B: 接受并 append 该 token
+                S->>S: accepted_count += 1
+            else mismatch
+                S->>B: append fallback token
+                S->>D: 释放旧 draft Sequence
+                S->>D: 用最新 base 前缀重建 draft Sequence
+                S->>S: resync_count += 1
+                Note over S,D: 中断本轮 verify，重新同步 draft
+            end
+        end
+    end
+
+    S-->>U: 返回 text、token_ids、acceptance_rate
+```
+
+#### 未来高性能版（整段 verify）时序图
+
+这张图描述的是后续希望演进到的版本。  
+核心变化是：**draft 先提一整段，base 一次性返回整段 verify logits**，从而减少 Python 循环和多次 decode 调用。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User Prompt
+    participant S as SpeculativeLLM
+    participant D as Draft Engine
+    participant B as Base Engine
+    participant T as 临时 Verify 状态
+
+    U->>S: generate(prompt)
+    S->>D: 创建 draft Sequence 并 prefill prompt
+    S->>B: 创建 base Sequence 并 prefill prompt
+
+    loop 直到达到 max_tokens 或 eos
+        S->>D: 连续 proposal 最多 K 个 token
+        D-->>S: 返回 draft token 序列
+
+        S->>T: 构造 verify_seq 与临时 block 和 slot 映射
+        S->>B: forward_verify_logits(verify_seq)
+        B-->>S: 返回整段 verify logits
+
+        S->>S: 一次性比对 draft_token_ids 与 verify_logits
+
+        alt 全部接受
+            S->>B: 批量推进 base 状态
+            S->>D: 保留 draft 状态继续 proposal
+        else 部分接受后 reject
+            S->>B: 接受前缀并 append fallback token
+            S->>D: 局部对齐或按需重建 draft 状态
+        end
+
+        S->>T: 释放临时 verify 状态
+    end
+
+    S-->>U: 返回 text、token_ids、acceptance_rate、speedup
+```
+
 ### 4. 为什么当前版本没有直接用“整段 verify 加速”
 
 因为要做真正高效的一次性 verify，还要解决两个工程问题：

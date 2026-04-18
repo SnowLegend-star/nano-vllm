@@ -767,3 +767,340 @@ commit --> nextStep[NextDecodeStep]
 这个 `MTP` 方案最合理的落地方式，不是把当前框架彻底推翻重写，而是：
 
 **保留现有单模型 decode 主链路，在 `Qwen3ForCausalLM` 顶部增加 proposal heads，在 `ModelRunner` 中新增 proposal-verify 执行路径，在 `LLMEngine` 中新增多 token 写回分支，并通过 benchmark 把它包装成一个可升级的 MTP 工程原型。**
+
+## 18. 代码分层图与文件边界
+
+这一节专门回答一个工程问题：
+
+- 以后如果继续改当前双模型 `speculative decoding`
+- 同时又要新增或迭代 `MTP`
+- 怎么避免两套逻辑互相缠住，导致改一处就要到处同步改
+
+核心原则只有一句话：
+
+**共享底层执行原语，不共享算法流程状态机。**
+
+也就是说：
+
+- `speculative decoding` 和 `MTP` 可以共用“前向 / logits / verify / sample”这类底层能力
+- 但不要让 `MTP` 直接复用 `SpeculativeLLM` 的双模型控制流
+- 也不要让 `SpeculativeLLM` 成为 `MTP` 的父类或基类
+
+### 18.1 推荐代码分层
+
+推荐把相关代码分成三层：
+
+1. 底层执行原语层
+2. 算法流程层
+3. 模型扩展层
+
+这三层的职责必须明确分开。
+
+### 18.2 分层图
+
+```mermaid
+flowchart TB
+    subgraph appLayer [AppAndEntry]
+        runQwen[run_qwen.py]
+        runTest[run_test.py]
+    end
+
+    subgraph algoLayer [AlgorithmFlowLayer]
+        baseEngine[LLMEngine]
+        specAlgo[SpeculativeLLM]
+        mtpAlgo[MtpLLMOrMtpEngine]
+    end
+
+    subgraph primitiveLayer [ExecutionPrimitiveLayer]
+        runner[ModelRunner]
+        sequence[Sequence]
+        scheduler[Scheduler]
+        blockManager[BlockManager]
+        sampler[Sampler]
+        context[ContextAndKVHelpers]
+    end
+
+    subgraph modelLayer [ModelExtensionLayer]
+        qwen[Qwen3ForCausalLM]
+        heads[ParallelLMHeadAndMtpHeads]
+    end
+
+    runQwen --> baseEngine
+    runQwen --> specAlgo
+    runQwen --> mtpAlgo
+    runTest --> specAlgo
+    runTest --> mtpAlgo
+
+    baseEngine --> runner
+    baseEngine --> scheduler
+    specAlgo --> runner
+    specAlgo --> sequence
+    specAlgo --> blockManager
+    mtpAlgo --> runner
+    mtpAlgo --> sequence
+    mtpAlgo --> scheduler
+
+    runner --> qwen
+    runner --> sampler
+    runner --> context
+    scheduler --> blockManager
+    qwen --> heads
+```
+
+这个图想表达的是：
+
+- `SpeculativeLLM` 和未来的 `MtpLLM` 应该是并列关系
+- 两者都依赖 `ModelRunner` 提供底层执行能力
+- 但两者各自维护自己的 proposal / verify / fallback 状态机
+- `MTP` 独有的模型结构改动只应该落在 `Qwen3ForCausalLM + mtp heads`
+
+### 18.3 哪些文件应该共享
+
+下面这些文件或模块应该作为共享层保留下来，供普通 decode、双模型 speculative、MTP 一起使用。
+
+#### 1. `nanovllm/engine/model_runner.py`
+
+这是最重要的共享层。
+
+适合共享的能力包括：
+
+- `forward_hidden_state()`
+- `forward_logits()`
+- `forward_verify_logits()`
+- `sample_from_logits()`
+- proposal 和 verify logits 的比对辅助函数
+
+也就是说，`ModelRunner` 应该尽量只提供“执行原语”，不要在这里写死：
+
+- draft/base 双模型语义
+- MTP 多头专属控制流
+- 某一种具体 speculative 算法的完整主循环
+
+更理想的职责是：
+
+- 负责把 `Sequence + mode` 变成可执行的模型前向
+- 负责返回 hidden states / logits / verify logits
+- 负责一些尽量无状态的辅助比对逻辑
+
+#### 2. `nanovllm/engine/sequence.py`
+
+`Sequence` 仍然应该是共享的基础序列结构。
+
+它适合承载：
+
+- token ids
+- prompt / completion 计数
+- block table
+- cache 生命周期
+
+但不适合承载：
+
+- 双模型 speculative 的 `base_state + draft_state`
+- MTP 的 proposal 临时状态
+
+也就是说，`Sequence` 只保留“单条真实序列”的通用状态，不承载某种算法的额外控制流。
+
+#### 3. `nanovllm/engine/scheduler.py`
+
+`Scheduler` 也应该是共享层，但只共享“通用调度”能力。
+
+适合共享：
+
+- prefill / decode / recompute 的调度框架
+- 和 `BlockManager` 的交互
+
+不适合一开始就放进去的内容：
+
+- 双模型 speculative 的 draft/base 协同逻辑
+- MTP 的 proposal 接受数量差异逻辑
+
+建议：
+
+- 第一版 `MTP` 和当前 `SpeculativeLLM` 都尽量少侵入 `Scheduler`
+- 等算法真正稳定后，再决定是否把一部分逻辑并回主调度器
+
+#### 4. `nanovllm/engine/block_manager.py`
+
+`BlockManager` 也应该尽量保持共享，但只服务于“真实已提交 token”。
+
+不要让它在第一版就理解：
+
+- speculative proposal token 的临时生命周期
+- MTP proposal token 的半提交状态
+
+否则会导致 block 语义迅速复杂化。
+
+#### 5. `nanovllm/layers/sampler.py`
+
+采样逻辑显然应该共享。
+
+但建议把“如何从 proposal logits 做接受判断”这类逻辑保留在算法层，而不是塞进 `Sampler`。
+
+#### 6. `nanovllm/utils/context.py`
+
+上下文、slot mapping、block tables 这些都应作为共享执行基础设施继续保留。
+
+### 18.4 哪些文件必须分开
+
+下面这些部分必须和当前双模型 speculative 解耦，单独实现。
+
+#### 1. `nanovllm/speculative_llm.py`
+
+这个文件应该继续专注于：
+
+- 双模型 draft/base speculative decoding
+- draft propose
+- base verify
+- reject 后 resync draft
+
+这是一套非常明确的双模型状态机。  
+它不应该承担：
+
+- MTP 多头 proposal
+- 单模型 internal verify
+- MTP 模型结构管理
+
+换句话说，`SpeculativeLLM` 不是 `MTP` 的父类，也不应该被 `MTP` 继承。
+
+#### 2. 新增 `nanovllm/mtp_llm.py` 或 `nanovllm/mtp_engine.py`
+
+建议给 `MTP` 单独建一个文件。
+
+它负责：
+
+- 组织 `compute_mtp_logits()`
+- 执行 proposal -> verify -> accept / fallback
+- 管理 MTP 独有统计项
+- 决定何时降级回普通 decode
+
+这样以后你改：
+
+- 双模型 speculative 的 resync 策略
+- draft length
+- verify 方式
+
+并不会强迫你同步修改 `MTP`。
+
+#### 3. `nanovllm/models/qwen3.py`
+
+`MTP` 对模型结构的扩展必须独立落在这里。
+
+这里可以新增：
+
+- `mtp_heads`
+- `compute_mtp_logits()`
+- proposal head 配置项
+
+这部分和当前双模型 speculative 没关系，因此不能混到 `speculative_llm.py` 里。
+
+#### 4. `nanovllm/layers/embed_head.py`
+
+如果为了 `MTP` 增加：
+
+- 多头 logits projection
+- 更灵活的 last-token / all-token 选择逻辑
+
+这些改动应该明确是“模型输出层能力扩展”，而不是 speculative 专属逻辑。
+
+### 18.5 推荐的文件归属表
+
+下面给出一个更直观的归属建议。
+
+#### 共享层
+
+- `nanovllm/engine/model_runner.py`
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/scheduler.py`
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/layers/sampler.py`
+- `nanovllm/utils/context.py`
+- `nanovllm/llm.py`
+
+#### 双模型 speculative 专属
+
+- `nanovllm/speculative_llm.py`
+
+#### MTP 专属
+
+- `nanovllm/mtp_llm.py` 或 `nanovllm/mtp_engine.py`
+- `nanovllm/models/qwen3.py` 中的 `mtp_heads / compute_mtp_logits`
+- `nanovllm/layers/embed_head.py` 中与 MTP logits 投影直接相关的扩展
+
+#### 入口与实验
+
+- `run_qwen.py`
+- `run_test.py`
+- 未来单独的 `bench_mtp.py` / `bench_speculative.py`
+
+### 18.6 最重要的边界规则
+
+为了防止以后维护变得很痛，建议遵守下面几条规则。
+
+#### 规则 1：算法层不能互相继承
+
+不要做成：
+
+- `class MtpLLM(SpeculativeLLM)`
+
+因为 `SpeculativeLLM` 的核心假设是：
+
+- 两个模型
+- 两套状态
+- draft/base 对齐
+
+而 `MTP` 的核心假设是：
+
+- 一个 backbone
+- 一个主头
+- 多个 future-token heads
+
+这两种状态机不是同一种东西。
+
+#### 规则 2：共享层只放“能力”，不放“策略”
+
+例如：
+
+- `forward_logits()` 是能力
+- “先 draft propose 再 base verify” 是策略
+- “先主头给当前 token，再 proposal heads 给未来 token” 也是策略
+
+能力可以共享，策略必须分开。
+
+#### 规则 3：共享接口命名尽量中性
+
+例如当前如果有：
+
+- `verify_draft_tokens()`
+
+那么更推荐逐步改成中性命名：
+
+- `verify_proposed_tokens()`
+- `match_proposals_against_logits()`
+
+这样接口就不会天然绑死在双模型 draft/base 语义上，`MTP` 也能直接复用。
+
+#### 规则 4：模型结构扩展只能放模型层
+
+凡是涉及：
+
+- 新的 logits head
+- hidden state transformation
+- MTP proposal heads
+
+都应该落在 `qwen3.py` 或相关 layer 文件，而不是塞进算法层脚本里。
+
+### 18.7 推荐演进路径
+
+如果按后续维护成本最低的方式演进，建议顺序如下：
+
+1. 继续把 `ModelRunner` 抽成稳定的共享执行原语层
+2. 保持 `SpeculativeLLM` 只做双模型 speculative
+3. 新增独立的 `MtpLLM` 或 `MtpEngine`
+4. 在 `Qwen3ForCausalLM` 中接入 `mtp_heads`
+5. 只在最后一步再考虑是否把某些稳定逻辑并入 `LLMEngine / Scheduler`
+
+### 18.8 一句话建议
+
+如果你后面确定还会继续重构当前 `speculative decoding`，那么最好的代码组织方式就是：
+
+**把 `SpeculativeLLM` 和未来的 `MTP` 视为两种并列算法实现，它们共享 `ModelRunner` 这一层执行原语，但绝不共享彼此的控制流状态机。**

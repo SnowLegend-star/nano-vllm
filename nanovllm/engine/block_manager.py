@@ -177,6 +177,7 @@ class BlockManager:
             seq.clear_recompute_state()
 
     def can_append(self, seq: Sequence) -> bool:
+        '''如果下一个 token 会让序列跨入一个新的 block, 就必须还有空闲 block'''
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
