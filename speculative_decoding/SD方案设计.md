@@ -460,6 +460,263 @@ sequenceDiagram
 - 还没有和原有 `Scheduler` 主循环深度融合
 - 还没有把 draft / base 的状态抽象成独立 `ModelCacheState`
 
+## 当前版本的问题分析
+
+下面这部分不是泛泛而谈，而是结合当前测试结果做的针对性分析。  
+例如在一次基线对比中：
+
+- baseline: `14.526 tok/s`
+- speculative: `7.386 tok/s`
+- `speedup_vs_baseline = 0.509x`
+- `accepted_tokens = 89`
+- `proposed_tokens = 208`
+- `acceptance_rate = 0.428`
+- `resync_count = 38`
+
+这些数字说明：当前 speculative decoding 不是“稍微没调好”，而是**在实现层面还没有真正打到 speculative decoding 的核心收益点**。
+
+### 1. base 的调用次数几乎没有真正降下来
+
+当前实现里，draft 虽然一次会 proposal 多个 token，但 base 不是“一次性整段 verify”，而是对 draft 的每个 token 都重新做一次 next-token 判断。
+
+这意味着：
+
+- baseline 生成 `128` 个 token，大致就是 `128` 次 base next-token 决策
+- 当前 speculative 版本里，base 仍然做了接近这个数量级的决策
+- 只是额外又叠加了一层 draft 的 proposal 成本
+
+换句话说，**当前版本没有把“大模型调用次数减少”这个 speculative decoding 最核心的收益真正兑现出来。**
+
+### 2. draft 带来的额外工作量远大于它节省下来的工作量
+
+当前一次测试里：
+
+- `proposed_tokens = 208`
+- `accepted_tokens = 89`
+- `acceptance_rate = 0.428`
+
+这说明：
+
+- draft 提出了很多 token
+- 但真正被 base 接受的比例并不高
+- 大量 proposal 最后都变成了额外计算
+
+当 acceptance rate 只有 `42.8%` 左右时，draft 这部分工作很容易从“加速器”变成“额外负担”。
+
+### 3. reject 路径太重，频繁重建 draft 状态
+
+当前实现一旦出现 mismatch，就会：
+
+- 释放旧 draft `Sequence`
+- 用最新 base 前缀重建 draft `Sequence`
+- draft 再重新 prefill / 恢复状态
+
+而测试里：
+
+- `resync_count = 38`
+
+这说明这种“释放 + 重建”的昂贵路径被触发了很多次。  
+它会直接带来：
+
+- 更多 block 管理开销
+- 更多前缀重建成本
+- 更多 Python 侧控制流开销
+
+这也是当前吞吐明显下滑的重要原因。
+
+### 4. 当前 `ModelRunner` 的 verify 接口虽然已经铺好，但上层还没真正用起来
+
+底层已经有：
+
+- `forward_verify_logits()`
+- `verify_draft_tokens()`
+
+也就是说，“一次性整段 verify” 所需的底层接口已经开始具备雏形。  
+但当前 `SpeculativeLLM` 上层逻辑仍然走的是：
+
+- draft 连续 proposal
+- base 逐 token verify
+
+所以现在的问题不是“完全没有 verify 能力”，而是**上层调度逻辑还没有切换到真正的整段 verify 路径**。
+
+### 5. 没有利用 full-accept 时的 bonus token
+
+标准 speculative decoding 通常在“整段 draft token 全部被接受”时，还会顺手拿到一个额外的 bonus token。  
+这个 bonus token 很重要，因为它是把 verify 成本进一步摊薄的关键收益之一。
+
+而当前版本里，这部分收益还没有真正落到上层控制流里。  
+因此即使整段 accept，也没有把 speculative decoding 的收益吃满。
+
+### 6. `torch.compile` 的重编译在放大小步推理的额外开销
+
+实际运行中已经看到类似告警：
+
+- `torch._dynamo hit config.recompile_limit`
+- `rms_forward`
+- `tensor 'x' rank mismatch. expected 3, actual 2`
+
+这说明 `RMSNorm` 这类被 `@torch.compile` 包裹的函数，在当前 speculative 路径下反复遇到不同形状输入。  
+这不会直接让程序错误，但会：
+
+- 带来额外重编译开销
+- 放大小步 decode / verify 场景下的性能损失
+
+这部分不是当前负优化的唯一原因，但确实在进一步恶化现状。
+
+### 7. 当前测试 prompt 也偏“难例”
+
+当前 benchmark prompt 会触发较长的思维链输出（例如 `<think>` 风格内容），这类输出通常：
+
+- token 更长
+- 推理链更复杂
+- draft 和 base 更容易分歧
+
+因此它会把当前实现中的这些问题进一步放大：
+
+- acceptance rate 偏低
+- resync 更频繁
+- 总体 proposal 浪费更严重
+
+所以当前 benchmark 结果既反映了实现问题，也反映了测试样例本身偏难。
+
+## 一句话归纳
+
+当前版本的根本问题不是“draft model 完全不可用”，而是：
+
+**当前实现仍然停留在“逻辑闭环版 speculative decoding”，还没有真正进入“减少 base 调用次数、降低 reject 成本、批量 verify”的性能版 speculative decoding。**
+
+## 当前已定位的 correctness 与 OOM 问题
+
+在进一步优化性能之前，当前版本还有两个已经明确定位出来的关键问题需要单独记录：
+
+### 1. accepted draft token 没有正确同步回 `base_state` 的 KV cache
+
+这是一个**正确性问题**，优先级非常高。
+
+#### 现象
+
+在把 `_verify_with_base()` 从“纯逐 token verify”改成“`q0 + 整段 verify`”之后，曾经出现过：
+
+- 输出文本明显异常
+- 出现大段重复符号或乱码式内容
+- `base_state.seq.token_ids` 看起来已经包含了被接受的 draft token
+- 但下一轮 decode 的 next token 明显不符合预期
+
+#### 根因
+
+问题不在于 prompt token 没有传进去，而在于：
+
+- `verify_state` 用来跑整段 verify
+- verify 完后只把 accepted token 追加回 `base_state.seq.token_ids`
+- 但这些 accepted token 对应的 K/V **并没有真正写回 `base_state` 自己的 cache**
+
+于是状态变成：
+
+- `token_ids` 看起来已经推进了
+- 但 `base_state` 底层的 KV cache 仍然停留在旧前缀
+
+后续 decode 就会在“token 序列”和“KV cache”不一致的情况下继续运行，最终导致输出错误。
+
+#### 当前处理方式
+
+当前已经把逻辑改成：
+
+- `_verify_with_base()` 只负责**判决**
+- 真正的 token 提交交给 `_commit_base_tokens()`
+- `_commit_base_tokens()` 会通过顺序 replay 的方式，把 accepted / fallback token 真正同步回 `base_state`
+
+这个版本的核心目的不是提速，而是先保证：
+
+- `base_state.seq.token_ids`
+- `base_state` 自己的 KV cache
+
+在语义上重新一致。
+
+#### 当前状态
+
+- 这个 correctness 问题已经有了初步修复思路
+- 但当前 `_commit_base_tokens()` 仍然是顺序 replay，成本较高
+- 后续仍然需要更高效的“批量提交 accepted token”方案
+
+### 2. `forward_verify_logits()` 先算整段全量 logits，导致 verify 阶段显存暴涨
+
+这是一个**OOM 问题**，也是当前整段 verify 路径里最典型的内存瓶颈。
+
+#### 现象
+
+实际运行中，曾出现类似错误：
+
+- `torch.OutOfMemoryError`
+- 错误点落在：
+  - `embed_head.py`
+  - `F.linear(x, self.weight)`
+  - `compute_logits(..., only_last_token=False)`
+  - `forward_verify_logits()`
+
+并且从堆栈看，OOM 并不是发生在 hidden states 阶段，而是发生在：
+
+- 把 hidden states 投影到整个 vocab logits 的那一步
+
+#### 根因
+
+旧版本的 `forward_verify_logits()` 逻辑是：
+
+1. 先对 verify suffix 得到完整 hidden states
+2. 再对完整 hidden states 做整段 `LM Head` 投影
+3. 最后才对 logits 做 `[-K:]` 切片
+
+问题在于：
+
+- 显存大头发生在 `hidden_states -> logits`
+- 等到最后切片时，显存已经花出去了
+
+所以这种写法本质上还是在算：
+
+- “整段未缓存 suffix 的全量 logits”
+
+而不是只算 verify 真正需要的那 `K` 个位置。
+
+#### 当前处理方式
+
+当前已经把 `forward_verify_logits()` 改成：
+
+- 先截取最后 `num_logits_to_keep` 个 hidden states
+- 再只对这部分 hidden states 做 `compute_logits(..., only_last_token=False)`
+
+也就是从：
+
+- `整段 hidden_states -> 整段 logits -> 切片`
+
+改成：
+
+- `整段 hidden_states -> 先切 hidden states -> 只算最后 K 个 logits`
+
+这一步可以显著降低 verify 阶段的 vocab projection 显存占用。
+
+#### 当前状态
+
+- 这个 OOM 根因已经开始被修正
+- 但还不能说彻底解决
+- 因为 verify 阶段仍然会构造一个完整的 `verify_state`
+- 如果 `verify_state` 本身的未缓存 suffix 过长，或者后续 replay / 状态管理叠加开销过大，仍然可能继续逼近显存上限
+
+## 这两个问题的关系
+
+这两个问题虽然一个偏正确性、一个偏显存，但它们其实是耦合的：
+
+- 如果 accepted token 的 KV 不正确同步回 `base_state`
+  - 后续 decode 结果会错
+  - benchmark 结果也不可信
+
+- 如果 `forward_verify_logits()` 仍然在算整段全量 logits
+  - 即使逻辑正确，整段 verify 也很可能先被 OOM 卡死
+
+所以当前阶段的合理策略是：
+
+1. 先保证 accepted token 的 KV 同步语义正确
+2. 再把 verify 阶段的 logits 计算范围缩到最小
+3. 最后再考虑真正的高性能批量提交和临时 verify 状态优化
+
 ## 下一步建议
 
 如果继续往前走，建议按这个顺序：

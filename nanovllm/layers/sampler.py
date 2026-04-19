@@ -7,9 +7,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__() # 仅继承nn.Module的基础初始化
 
-    @torch.compile # PyTorch 2.0+ 编译优化：将Python代码编译为高效CUDA/C++代码
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
     # 步骤1：温度缩放（控制生成随机性，温度越高越随机）
+        # 极低温度下直接退化为 greedy，避免无意义的随机采样开销，
+        # 同时绕开当前环境里 RNG 与 CUDA Graph 交互带来的不稳定性。
+        if torch.all(temperatures <= 1e-5):
+            return logits.argmax(dim=-1)
+
         # logits.float()：转float避免精度溢出；div_：原地除法（节省显存，无中间张量）
         # temperatures.unsqueeze(dim=1)：扩维（如[bs]→[bs,1]），匹配logits形状[bs, vocab_size]
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))

@@ -15,7 +15,7 @@ SAMPLING_PARAMS = SamplingParams(
 )
 
 BASE_KWARGS = {
-    "enforce_eager": False,
+    "enforce_eager": True,
     "tensor_parallel_size": 1,
     "dtype": "float16",
     "max_model_len": 1024,
@@ -23,7 +23,7 @@ BASE_KWARGS = {
 }
 
 DRAFT_KWARGS = {
-    "enforce_eager": False,
+    "enforce_eager": True,
     "tensor_parallel_size": 1,
     "dtype": "float16",
     "max_model_len": 1024,

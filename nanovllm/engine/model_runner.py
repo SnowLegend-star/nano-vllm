@@ -436,9 +436,17 @@ class ModelRunner:
         """
         try:
             hidden_states = self.forward_hidden_state(seqs, mode)
-            logits = self.model.compute_logits(hidden_states, only_last_token=False)
             if num_logits_to_keep is not None:
-                logits = logits[-num_logits_to_keep:]
+                # 关键优化：
+                # 不再先把整段 hidden_states 全部投影到 vocab 再切片，
+                # 而是先截取 verify 真正需要的最后若干个 hidden states，
+                # 再做 LM Head 投影。这样能显著降低 verify 阶段的显存占用。
+                #
+                # 当前 SpeculativeLLM 只在“单请求 verify”场景里调用这里，
+                # 所以 last-K 语义和当前上层控制流是一致的。
+                assert len(seqs) == 1, "num_logits_to_keep currently only supports single-sequence verify."
+                hidden_states = hidden_states[-num_logits_to_keep:].contiguous()
+            logits = self.model.compute_logits(hidden_states, only_last_token=False)
             return logits
         finally:
             reset_context()

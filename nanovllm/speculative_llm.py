@@ -18,7 +18,7 @@ class SpeculativeLLM:
     最小可运行版 speculative decoding:
     - 单请求逐条处理，不做 batch
     - 使用 greedy proposal / greedy verify
-    - base 逐 token verify，保证逻辑先跑通
+    - 当前版本已切到“q0 + 整段 verify”路径
     - reject 后直接重建 draft 序列，便于后续替换成高性能 verify
     """
 
@@ -64,6 +64,7 @@ class SpeculativeLLM:
             engine.scheduler.block_manager.deallocate(seq)
 
     def _next_logits(self, engine: LLMEngine, state: _SequenceState):
+        '''获取下一个token的logits, 有Prefill和Decode两种情况'''
         if not state.prefilled:
             logits = engine.model_runner.forward_logits([state.seq], "prefill")
             state.prefilled = True
@@ -83,7 +84,37 @@ class SpeculativeLLM:
     def _sequence_finished(seq: Sequence, token_id: int, eos_token_id: int) -> bool:
         return token_id == eos_token_id or seq.num_completion_tokens >= seq.max_tokens
 
+    @staticmethod
+    def _sampling_params_from_seq(seq: Sequence) -> SamplingParams:
+        return SamplingParams(
+            temperature=seq.temperature,
+            max_tokens=seq.max_tokens,
+            ignore_eos=seq.ignore_eos,
+        )
+
+    def _commit_base_tokens(self, state: _SequenceState, token_ids: list[int]):
+        """
+        把已经判决完成的 token 真正同步回 base_state。
+        当前实现采用顺序 replay：
+        - 逐个 append 已知 token
+        - 对除最后一个之外的 token，额外跑一次 _next_logits 来 materialize KV
+
+        这样虽然还不够快，但至少能保证：
+        - base_state.seq.token_ids
+        - base_state 的 KV cache
+        在语义上重新一致。
+        """
+        if not token_ids:
+            return
+
+        for idx, token_id in enumerate(token_ids):
+            state.seq.append_token(token_id)
+            if idx == len(token_ids) - 1:
+                continue
+            _ = self._next_logits(self.base_engine, state)
+
     def _propose_with_draft(self, state: _SequenceState, max_steps: int) -> list[int]:
+        '''token by token生成n个draft'''
         proposal_token_ids = []
         eos_token_id = self.draft_engine.scheduler.eos
         for _ in range(max_steps):
@@ -96,26 +127,70 @@ class SpeculativeLLM:
         return proposal_token_ids
 
     def _verify_with_base(self, state: _SequenceState, draft_token_ids: list[int]) -> tuple[int, list[int], int | None]:
+        """
+        当前版本的整段 verify:
+        1. 先用一次 decode logits 得到 q0，用来比较 d1
+        2. 若 d1 通过，再对完整 draft suffix 做一次 prefill verify，拿到 q1..qk
+        3. 用 q1..q{k-1} 比较 d2..dk
+        4. 当前版本先不消费 qk bonus token，后续再接入
+        """
+        assert draft_token_ids
+        eos_token_id = self.base_engine.scheduler.eos
         accepted_count = 0
         accepted_token_ids: list[int] = []
-        eos_token_id = self.base_engine.scheduler.eos
 
-        for draft_token_id in draft_token_ids:
-            logits = self._next_logits(self.base_engine, state)
-            base_token_id = self._greedy_from_logits(logits)
+        # 1. 当前真实前缀的 next-token logits: q0
+        q0_logits = self._next_logits(self.base_engine, state)
+        q0_token_id = self._greedy_from_logits(q0_logits)
 
-            if base_token_id == draft_token_id:
-                accepted_count += 1
-                accepted_token_ids.append(draft_token_id)
-                state.seq.append_token(draft_token_id)
-                if self._sequence_finished(state.seq, draft_token_id, eos_token_id):
-                    return accepted_count, accepted_token_ids, None
-                continue
+        # d1 mismatch，直接走 fallback，无需再构造 verify_seq
+        if q0_token_id != draft_token_ids[0]:
+            return accepted_count, accepted_token_ids, q0_token_id
 
-            state.seq.append_token(base_token_id)
-            return accepted_count, accepted_token_ids, base_token_id
+        # d1 accepted。注意这里只做“判决”，不在这里直接修改 base_state，
+        # 否则 token_ids 和真实 KV 状态会再次脱节。
+        first_token_id = draft_token_ids[0]
+        accepted_count = 1
+        accepted_token_ids.append(first_token_id)
+        if self._sequence_finished(state.seq, first_token_id, eos_token_id):
+            return accepted_count, accepted_token_ids, None
 
-        return accepted_count, accepted_token_ids, None
+        if len(draft_token_ids) == 1:
+            return accepted_count, accepted_token_ids, None
+
+        # 2. 对完整 draft suffix 做一次 verify prefill，拿到 q1..qk
+        verify_state = None
+        try:
+            verify_state = self._make_sequence(
+                self.base_engine,
+                list(state.seq.token_ids) + draft_token_ids,
+                self._sampling_params_from_seq(state.seq),
+            )
+            verify_logits = self.base_engine.model_runner.forward_verify_logits(
+                [verify_state.seq],
+                "prefill",
+                num_logits_to_keep=len(draft_token_ids),
+            )
+            # verify_logits = [q1, q2, ... , qk]
+            remaining_draft_token_ids = draft_token_ids[1:]
+            if remaining_draft_token_ids:
+                accepted_tail_count, accepted_tail_token_ids, fallback_token_id = (
+                    self.base_engine.model_runner.verify_draft_tokens(
+                        remaining_draft_token_ids,
+                        verify_logits[:-1],
+                        include_bonus_token=False,
+                    )
+                )
+            else:
+                accepted_tail_count, accepted_tail_token_ids, fallback_token_id = 0, [], None
+        finally:
+            self._free_sequence(self.base_engine, verify_state)
+
+        # 3. 汇总判决结果，真正的 KV 同步交给 _commit_base_tokens 去做
+        for token_id in accepted_tail_token_ids:
+            accepted_count += 1
+            accepted_token_ids.append(token_id)
+        return accepted_count, accepted_token_ids, fallback_token_id
 
     def _generate_one(
         self,
@@ -148,8 +223,13 @@ class SpeculativeLLM:
                     break
 
                 proposed_tokens += len(proposal_token_ids)
-                accepted_count, _, fallback_token_id = self._verify_with_base(base_state, proposal_token_ids)
+                accepted_count, accepted_token_ids, fallback_token_id = self._verify_with_base(base_state, proposal_token_ids)
                 accepted_tokens += accepted_count
+
+                tokens_to_commit = list(accepted_token_ids)
+                if fallback_token_id is not None:
+                    tokens_to_commit.append(fallback_token_id)
+                self._commit_base_tokens(base_state, tokens_to_commit)
 
                 if self._sequence_finished(
                     base_state.seq,
