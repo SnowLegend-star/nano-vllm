@@ -278,17 +278,26 @@ class ModelRunner:
             # 7. 处理KV缓存的slot映射（仅当序列已有块表时，即非首次warmup）
             if not seq.block_table:    # warmup（首次分配块，无块表）→ 跳过
                 continue
+            uncached_start = seq.num_cached_tokens
+            start_block = uncached_start // self.block_size
+            start_offset = uncached_start % self.block_size
             # 遍历序列的「未缓存块」（已缓存块的token在KV里，无需映射）
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
+            for i in range(start_block, seq.num_blocks):
                 # 计算当前块在KV缓存中的起始slot：块ID × 块大小
                 start = seq.block_table[i] * self.block_size
+                token_offset = start_offset if i == start_block else 0
                 # 计算当前块的结束slot：完整块=start+block_size，最后一块=start+实际token数
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
+                start += token_offset
+                if start >= end:
+                    continue
                 # 收集当前块的所有slot索引（每个token对应一个slot）
                 slot_mapping.extend(list(range(start, end)))
+        if slot_mapping:
+            assert len(input_ids) == len(slot_mapping), "prefill input_ids and slot_mapping should align."
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables([seq.block_table for seq in seqs])
         # 将所有收集的列表转成CUDA张量，适配模型推理

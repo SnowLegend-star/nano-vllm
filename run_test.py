@@ -52,7 +52,7 @@ def run_speculative(prompt: str):
     llm = SpeculativeLLM(
         BASE_MODEL_PATH,
         DRAFT_MODEL_PATH,
-        draft_length=4,
+        draft_length=2,
         base_kwargs=BASE_KWARGS,
         draft_kwargs=DRAFT_KWARGS,
     )

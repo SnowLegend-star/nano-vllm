@@ -11,7 +11,6 @@ class RMSNorm(nn.Module):
         # RMSNorm 不需要偏置项 bias (beta)，只有 weight
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile  # PyTorch 2.0 编译优化，尝试将算子融合为一个 Kernel
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype # 记录原始精度 (如 float16)
         
@@ -35,7 +34,6 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,        # 当前层的输出

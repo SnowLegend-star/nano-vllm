@@ -514,8 +514,13 @@ class Attention(nn.Module):
         # ------------------------
         if context.is_prefill:
             if HAS_FLASH_ATTN:
+                attn_k, attn_v = k, v
+                # 带 block_table 的 prefill 走的是 paged KV 路径，
+                # 这里必须把 paged cache 传给 FlashAttention。
+                if context.block_tables is not None:
+                    attn_k, attn_v = k_cache, v_cache
                 o = flash_attn_varlen_func(
-                    q, k, v,
+                    q, attn_k, attn_v,
                     max_seqlen_q=context.max_seqlen_q,
                     cu_seqlens_q=context.cu_seqlens_q,
                     max_seqlen_k=context.max_seqlen_k,
