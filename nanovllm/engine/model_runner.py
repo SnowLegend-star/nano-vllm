@@ -32,7 +32,7 @@ class ModelRunner:
 
         # 步骤3：GPU推理环境配置（数据类型/设备）
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)  # 设为模型指定 dtype（如float16）
+        torch.set_default_dtype(hf_config.dtype)  # 设为模型指定 dtype（如float16）
         torch.set_default_device("cuda")  # 默认设备切到GPU
 
         # 步骤4：模型加载与初始化
@@ -155,7 +155,7 @@ class ModelRunner:
     #     current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
     #     num_kv_heads = hf_config.num_key_value_heads // self.world_size
     #     head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-    #     block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+    #     block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
     #     config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
     #     assert config.num_kvcache_blocks > 0
     #     self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
@@ -184,7 +184,7 @@ class ModelRunner:
         
         # 计算一个 Block 需要多少字节
         # 注意：这里我们假设之后创建 Cache 使用与模型相同的 dtype (float16)，所以显存计算更精准
-        dtype_size = hf_config.torch_dtype.itemsize 
+        dtype_size = hf_config.dtype.itemsize 
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype_size
         
         # --- 2. 打印调试信息 (看看显存到底去哪了) ---
@@ -216,7 +216,7 @@ class ModelRunner:
         assert config.num_kvcache_blocks > 0
 
         # --- 5. 创建 KV Cache Tensor (关键优化) ---
-        # 增加 dtype=hf_config.torch_dtype，强制使用 float16。
+        # 增加 dtype=hf_config.dtype，强制使用 float16。
         # 原代码没有加 dtype，默认是 float32，显存占用会翻倍！
         self.kv_cache = torch.empty(
             2, 
@@ -225,7 +225,7 @@ class ModelRunner:
             self.block_size, 
             num_kv_heads, 
             head_dim,
-            dtype=hf_config.torch_dtype,  # <--- 必须加这个，省一半显存
+            dtype=hf_config.dtype,  # <--- 必须加这个，省一半显存
             device="cuda"                 # <--- 显式指定设备
         )
         
@@ -457,14 +457,47 @@ class ModelRunner:
                 # 而是先截取 verify 真正需要的最后若干个 hidden states，
                 # 再做 LM Head 投影。这样能显著降低 verify 阶段的显存占用。
                 #
-                # 当前 SpeculativeLLM 只在“单请求 verify”场景里调用这里，
-                # 所以 last-K 语义和当前上层控制流是一致的。
-                assert len(seqs) == 1, "num_logits_to_keep currently only supports single-sequence verify."
-                hidden_states = hidden_states[-num_logits_to_keep:].contiguous()
+                # V5.0 起支持 batched speculative verify：prefill 的 hidden_states
+                # 是按 seq 顺序拼接的，所以这里按每条 seq 的 query 长度切片，
+                # 分别取末尾 last-K，再 stack 成 [B, K, H]。
+                hidden_states = self._slice_last_hidden_states(
+                    seqs,
+                    hidden_states,
+                    num_logits_to_keep,
+                )
             logits = self.model.compute_logits(hidden_states, only_last_token=False)
             return logits
         finally:
             reset_context()
+
+    @staticmethod
+    def _slice_last_hidden_states(
+        seqs: list[Sequence],
+        hidden_states: torch.Tensor,
+        num_logits_to_keep: int,
+    ) -> torch.Tensor:
+        if num_logits_to_keep <= 0:
+            raise ValueError("num_logits_to_keep must be positive.")
+
+        if len(seqs) == 1:
+            return hidden_states[-num_logits_to_keep:].contiguous()
+
+        # prefill/query hidden 按 seq 顺序拼接：[seq0_q, seq1_q, ...]
+        # 每条 seq 在 speculative verify 时真正需要的是自己的最后 K 个 query
+        # 位置，而不是整个 batch 的最后 K 个 hidden。
+        offset = 0
+        sliced_hidden_states = []
+        for seq in seqs:
+            query_len = seq.num_tokens - seq.num_cached_tokens
+            if query_len < num_logits_to_keep:
+                raise RuntimeError(
+                    "verify query length is smaller than num_logits_to_keep in batched forward_verify_logits."
+                )
+            seq_hidden_states = hidden_states[offset: offset + query_len]
+            sliced_hidden_states.append(seq_hidden_states[-num_logits_to_keep:])
+            offset += query_len
+
+        return torch.stack(sliced_hidden_states, dim=0).contiguous()
 
     @torch.inference_mode()
     def sample_from_logits(self, logits: torch.Tensor, temperatures: torch.Tensor):

@@ -63,7 +63,7 @@ class Scheduler:
                 kept.append(seq)
                 continue
             while not self.block_manager.can_append(seq):
-                victim = self._take_victim(running, kept, seq)
+                victim = self._take_victim(running, seq)
                 if victim is None:
                     if self.evict_or_preempt(seq):
                         kept.append(seq)
@@ -101,13 +101,14 @@ class Scheduler:
             self.preempt(seq)
         return []
 
-    def _take_victim(self, running: list[Sequence], kept: list[Sequence], exclude: Sequence):
-        for container in (running, kept):
-            for i in range(len(container) - 1, -1, -1):
-                seq = container[i]
-                if seq is exclude or seq.recompute_pending:
-                    continue
-                return container.pop(i)
+    def _take_victim(self, running: list[Sequence], exclude: Sequence):
+        # 只从尚未进入本轮 decode 执行集的 running 中挑 victim，
+        # 避免把已经放进 scheduled_seqs/kept 的序列回收掉，导致 block_table 被清空。
+        for i in range(len(running) - 1, -1, -1):
+            seq = running[i]
+            if seq is exclude or seq.recompute_pending:
+                continue
+            return running.pop(i)
         return None
 
     def evict_or_preempt(self, seq: Sequence) -> bool:

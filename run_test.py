@@ -50,6 +50,15 @@ SAMPLING_PARAMS = SamplingParams(
 
 BASE_KWARGS = {
     "enforce_eager": True,
+    "cudagraph_max_bs": 1,
+    "tensor_parallel_size": 1,
+    "dtype": "float16",
+    "max_model_len": 1024,
+    "kvcache_memory_budget": 6,
+}
+
+SPEC_BASE_KWARGS = {
+    "enforce_eager": True,
     "tensor_parallel_size": 1,
     "dtype": "float16",
     "max_model_len": 1024,
@@ -107,7 +116,7 @@ def run_speculative_suite(draft_lengths: list[int]):
         BASE_MODEL_PATH,
         DRAFT_MODEL_PATH,
         draft_length=draft_lengths[0],
-        base_kwargs=BASE_KWARGS,
+        base_kwargs=SPEC_BASE_KWARGS,
         draft_kwargs=DRAFT_KWARGS,
     )
     try:

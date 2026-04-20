@@ -69,8 +69,9 @@ def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
 | V3 | 增量状态复用 | verify / resync 都走增量 fork，partial block 也能复用 | 已被替代 |
 | V4.0 | fused q0 + verify | 每轮 base 只做一次 prefill(k+1)，全接受自动吃 bonus | 已被替代 |
 | V4.1 | 消灭 Case C dummy decode | draft 侧多 uncached token 走 prefix-cache prefill，一次算完 `[d_k, bonus]` | 已被替代 |
-| V4.2 | draft CUDA Graph + graph-friendly `store_kvcache` | 重写 `store_kvcache` 去掉 host sync，顺势打通 draft bs=1 CUDA Graph | **当前版本** |
-| V5+ 目标 | Batch SD | 多 request 共享 base verify，真正把绝对吞吐拉起来 | 规划中 |
+| V4.2 | draft CUDA Graph + graph-friendly `store_kvcache` | 重写 `store_kvcache` 去掉 host sync，顺势打通 draft bs=1 CUDA Graph | 已被替代 |
+| V5.0 | fixed batch=2 同步 MVP | 新增独立 `generate_batch()`，draft propose / base verify 都真正 batched | **当前版本** |
+| V5.1+ 目标 | 异步 Batch SD | 多 request 动态 batching，共享 base verify，真正把绝对吞吐拉起来 | 规划中 |
 
 后面每一节会按「目标 / 主要改动 / 时序图（可选）/ 性能观察 / 剩余问题」五个维度讲。
 
@@ -1041,6 +1042,61 @@ DRAFT_KWARGS = {
 > 单位：tok/s。base / speedup 都按同一版本内的 baseline tok/s 算。
 > V4.2 启用后，baseline 本身 **+12% 左右**（eager 模式也少了 `store_kvcache` 的 host sync），spec k=2 平均 **1.27x**，spec k=3 平均 **1.47x**。
 
+#### 11.4.1 最新完整归档（`run_test.py` 原始数据）
+
+下面这张表归档的是一次**完整 prompt suite** 的最新 `run_test.py` 输出。和上面的“V4.1 vs V4.2 首次对比表”相比，这里保留了更完整的 acceptance / resync / accepted-proposed 统计，便于后续直接对照控制流是否漂移。
+
+| prompt | base tok/s | k=2 tok/s | speedup | accept | resync | accepted/proposed | k=3 tok/s | speedup | accept | resync | accepted/proposed |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
+| think_long | 24.13 | 32.05 | 1.33x | 0.637 | 26 | 72/113 | 39.53 | 1.64x | 0.500 | 36 | 77/154 |
+| short_qa | 27.33 | 34.91 | 1.28x | 0.673 | 24 | 74/110 | 37.27 | 1.36x | 0.534 | 32 | 79/148 |
+| factual_list | 27.90 | 33.02 | 1.18x | 0.545 | 35 | 67/123 | 37.59 | 1.35x | 0.469 | 36 | 75/160 |
+| template_code | 27.70 | 35.11 | 1.27x | 0.673 | 23 | 74/110 | 41.53 | 1.50x | 0.606 | 24 | 83/137 |
+| casual_chat | 27.65 | 33.23 | 1.20x | 0.562 | 32 | 68/121 | 39.39 | 1.42x | 0.537 | 30 | 79/147 |
+
+这次完整归档的几个要点：
+
+- **k=2 平均 speedup ≈ 1.25x**
+- **k=3 平均 speedup ≈ 1.45x**
+- acceptance / resync / accepted-proposed 与前一轮 V4.2 归档**基本一致**
+- 波动主要来自**baseline 绝对 tok/s 的运行时漂移**（warmup、allocator 状态、driver 波动等），不是 speculative 控制流变了
+
+所以从“行为是否稳定”这个角度看，V4.2 现在已经比较稳：
+
+1. **相对排序没变**：`k=3` 仍然系统性优于 `k=2`
+2. **最差 prompt 仍然是 `factual_list`**：acceptance 最低，speedup 也最低
+3. **`template_code` / `think_long` 仍然是收益最明显的两类**，说明当前 draft/base 组合更吃“模式化连续片段”或“较长连续接受链”
+
+#### 为什么收益会这么大（拆账）
+
+这次 V4.2 的收益不能简单理解成“开了 CUDA Graph，所以快了一点”。它其实是**两笔收益叠加**：
+
+| 来源 | 谁受益 | 量级 |
+|---|---|---|
+| `store_kvcache` 去掉 per-layer host sync | baseline + base/draft eager 路径 | **~+12%** |
+| draft bs=1 decode 走 CUDA Graph | speculative 路径里的 draft engine | **draft 单次 forward 约 2x+** |
+
+先看第一笔：
+
+- 旧版 `store_kvcache` 里的 `slot_mapping[mask]` 和 `valid_slots.numel() > 0` 都会触发 **GPU→CPU 同步**
+- 这个函数是 **每个 attention layer 都会走一次**
+- 所以在 bs=1 decode 下，base 4B / draft 0.6B 都在为“每层一次同步”持续付钱
+
+这解释了为什么 **baseline 本身也变快了**。虽然 baseline 并没有打开 CUDA Graph，但它一样吃到了新版 `store_kvcache` 去同步的收益。
+
+再看第二笔：
+
+- draft 0.6B 在 bs=1 decode 下，本来就不是“算力打满”的场景
+- 单次 forward 的真实 GPU kernel 时间并不长，但 kernel launch / Python dispatch / tensor metadata / context 切换等固定开销占比很高
+- CUDA Graph 把这类固定开销整体压平，所以**越小、越短、越 bs=1 的 forward，收益反而越夸张**
+
+也就是说，V4.2 看到的大幅提升，本质上不是“单纯 launch overhead 少了几微秒”，而是：
+
+1. 先把 `store_kvcache` 这条**之前没被识别出来的隐藏同步路径**清掉
+2. 再让 draft bs=1 decode 的一整段 op 序列走 Graph replay，把 driver / dispatcher / launch 开销整体摊平
+
+所以它不是“一个 2~4% 的小优化突然神奇变成 60%+”，而是**两个之前被混在一起的大头 overhead 同时被打掉了**。
+
 三个反直觉现象：
 
 1. **baseline 也变快了**：V4.2 只给 draft engine 开了 Graph，但 baseline（只加载 base 4B、`enforce_eager=True`）的 tok/s 也从 ~24 涨到 ~28。
@@ -1086,6 +1142,142 @@ V4.2 的额外价值是**为 V5 铺路**：draft batch decode shape 也固定（
 - [x] acceptance rate / accepted / proposed 数字 V4.1 → V4.2 不变（只动了执行路径，没动算法）
 - [x] Graph capture 失败时 `[WARNING]` fallback 生效（测试：临时改 `store_kvcache` 加一次 `.item()` 模拟失败）
 - [x] `run_test.py` 的 baseline 同样受益（eager 路径也走新版 `store_kvcache`）
+
+## 12. V5.0：fixed batch=2 同步 MVP（当前版本）
+
+V4.2 把单 seq speculative decoding 做到 1.4x+ 之后，下一步已经不是再抠单轮几十微秒，而是把**两个请求一起跑**，让 draft propose 和 base verify 都真正吃到 batch。V5.0 的目标不是一次做成 production 级异步 batch SD，而是先验证：**在不碰原生 Scheduler 的前提下，只靠 `SpeculativeLLM` 上层状态机，能不能把吞吐再拉一截。**
+
+### 12.1 目标与边界
+
+V5.0 刻意只做一个最小版本：
+
+- 新增独立 `generate_batch()` API，不改现有单请求 `generate()`
+- 只支持 **fixed batch=2**
+- 两条请求按**同步轮次**推进：一起 propose，一起 verify；谁先结束就先退出，另一条允许出现 bubble
+- draft propose 和 base verify 都做真正 batched forward
+- 不做与 `Scheduler` 融合，不做任意 batch size，不做异步状态机
+
+这版的价值是验证“batch SD 的主收益是不是主要来自上层控制流改造”，而不是先把整个引擎大改一遍。
+
+### 12.2 核心改动
+
+#### 12.2.1 `SpeculativeLLM` 新增批版 API 和同步状态机
+
+`nanovllm/speculative_llm.py` 新增：
+
+- `generate_batch()`
+- `_generate_batch2()`
+- `_propose_batch_with_draft()`
+- `_verify_batch_with_base()`
+- `_next_logits_batch()`
+
+设计要点：
+
+1. **draft propose 真正 batch**
+   - 每个 proposal step 收集当前活跃请求
+   - 按 `uncached` 形态拆成 `decode(uncached==1)` 和 `prefill(uncached>=2)` 两组
+   - 对每组分别调一次 batched `forward_logits()`
+
+2. **base verify 真正 batch**
+   - 每个槽位先各自 `_fork_sequence_from_state()`
+   - 若本轮 proposal 长度相同，则把多条 verify seq 一次性送进 batched `forward_verify_logits(..., num_logits_to_keep=k+1)`
+   - 接受/拒绝逻辑仍按槽位逐条判决，继续复用已有 `_adopt_base_verify_state()` / `_truncate_sequence()`
+
+3. **不改单请求路径**
+   - 现有 `_generate_one()` 和 `generate()` 保持原样
+   - V5.0 的风险被隔离在新 API 内
+
+#### 12.2.2 `forward_verify_logits()` 支持 batched last-K 切片
+
+V5.0 真正必须补的一处底层能力在 `nanovllm/engine/model_runner.py`：
+
+- 旧版 `forward_verify_logits(..., num_logits_to_keep=...)` 只支持单条 seq，直接 `hidden_states[-K:]`
+- batched prefill 下 `hidden_states` 是按 seq 顺序拼接的，必须按每条 seq 的 query 长度切出自己的最后 K 个 hidden states
+
+V5.0 改成：
+
+- 单 seq 时沿用旧逻辑
+- 多 seq 时按 `query_len = seq.num_tokens - seq.num_cached_tokens` 切片
+- 得到 `[B, K, H]` 后再做 LM Head 投影
+
+这一步把 “base verify batched” 从概念变成了真正的单次 GPU forward。
+
+### 12.3 时序图（同步 batch=2）
+
+```mermaid
+flowchart TD
+    init[initTwoRequests] --> prefill[prefillBasePromptKV batch]
+    prefill --> loop[batchLoop]
+    loop --> propose[batchDraftPropose]
+    propose --> verify[batchBaseVerify]
+    verify --> update[perSlotAdoptOrResync]
+    update --> doneCheck{allFinished}
+    doneCheck -->|no| loop
+    doneCheck -->|yes| finish[collectOutputs]
+```
+
+注意这里的“batch”仍是 **同步批**：
+
+- 如果两条请求本轮 proposal 长度一致，就一起 verify
+- 如果其中一条提前 EOS / `remaining` 更小，就会拆成单独 verify
+- 这也是为什么 V5.0 只是 MVP，不是最终形态
+
+### 12.4 实测结果（`run_batch_test.py`）
+
+benchmark 配置：
+
+- baseline：单模型 4B，**顺序 serving 两条请求**
+- single speculative：沿用 V4.2 单请求路径，依次处理两条请求
+- batch speculative：V5.0 `generate_batch()`，固定 batch=2
+- draft 继续开 CUDA Graph，但 `cudagraph_max_bs` 从 1 提到 **2**
+
+| pair | base tok/s | single k=2 | batch k=2 | single k=3 | batch k=3 |
+|---|---:|---:|---:|---:|---:|
+| think_plus_code | 25.79 | 30.87 | **58.12** | 38.70 | **65.73** |
+| qa_plus_chat | 27.94 | 32.41 | **53.14** | 37.91 | **63.87** |
+
+换成 speedup（相对 sequential baseline）：
+
+| pair | single k=2 | batch k=2 | single k=3 | batch k=3 |
+|---|---:|---:|---:|---:|
+| think_plus_code | 1.20x | **2.25x** | 1.50x | **2.55x** |
+| qa_plus_chat | 1.16x | **1.90x** | 1.36x | **2.29x** |
+
+两个直接结论：
+
+1. **V5.0 的 batch=2 MVP 已经明显比 V4.2 单请求更快**
+   - `think_plus_code`：58.12 / 30.87 ≈ **1.88x**（k=2），65.73 / 38.70 ≈ **1.70x**（k=3）
+   - `qa_plus_chat`：53.14 / 32.41 ≈ **1.64x**（k=2），63.87 / 37.91 ≈ **1.68x**（k=3）
+
+2. **batch 收益已经开始接近“乘法效应”**
+   - V4.2 单请求主要赢在“单轮成本变低”
+   - V5.0 再往前一步，把两条请求的 draft propose / base verify 合在一起
+   - 所以 speedup 已经从单请求的 `~1.2-1.5x` 抬到 batch=2 的 `~1.9-2.6x`
+
+### 12.5 当前限制（为什么它还只是 MVP）
+
+V5.0 明显有收益，但还远没到最终形态：
+
+- 只支持固定 **batch=2**
+- 是**同步批**，不是异步状态机；一条先结束，另一条会有 bubble
+- 只有当 proposal 长度一致时，base verify 才能真正合成一个 batch；否则会拆成多个 verify group
+- 还没和原生 `Scheduler` 融合，所以它本质上还是 `SpeculativeLLM` 外挂出来的一条并行生成路径
+
+因此 V5.0 的定位应该是：**throughput proof-of-concept**，证明 batch SD 的主要收益方向是成立的；而不是已经完成了 production 级的 request 调度。
+
+### 12.6 对后续路线的影响
+
+V5.0 之后，路线比之前更清楚了：
+
+- **V4.2** 证明了单 seq 的 kernel / host sync 优化能把单请求拉到 1.4x+
+- **V5.0** 证明了哪怕只做 fixed batch=2，同步批也能把总吞吐再抬到 2x+ 量级
+
+这说明 §10 的大方向是对的：真正值得继续投的不是再抠单请求那几个微优化，而是：
+
+1. **V5.1：任意 batch + 异步状态机**
+2. **V5.2：和原生 Scheduler 融合**
+
+从 ROI 来看，V5.0 已经把“batch 这条线值得做”从理论判断变成了实测结论。
 
 ## 附录 A：已解决的历史问题
 
@@ -1139,7 +1331,7 @@ V4.2 的额外价值是**为 V5 铺路**：draft batch decode shape 也固定（
 
 ## 附录 C：当前仍然存在的限制
 
-- `SpeculativeLLM` 还是串行处理请求，没有 batch SD
+- `SpeculativeLLM` 只有 fixed batch=2 的同步 batch API，还没有任意 batch / 异步 batch SD
 - 还没有和原生 `Scheduler` 融合
 - 还没把 draft / base 的状态抽成独立 `ModelCacheState`
 - `draft_length` 只支持固定值，没做按 acceptance rate 自适应
@@ -1148,12 +1340,14 @@ V4.2 的额外价值是**为 V5 铺路**：draft batch decode shape 也固定（
 
 （此清单已被 §10 + §11 的结论更新，保留早期视角做对比。）
 
-**已落地 (V4.2)**
+**已落地**
 
 - 重写 `store_kvcache` 为 graph-friendly 版本
 - draft engine 启用 CUDA Graph (`cudagraph_max_bs=1`)
 - 顺带让 baseline eager 路径也少每层一次 host sync
 - **结果**：k=3 从 0.72x → 1.47x 平均，首次稳定突破 1.0x
+- V5.0 fixed batch=2 同步 MVP：新增 `generate_batch()`，draft propose / base verify 都真正 batched
+- **结果**：batch=2 总吞吐达到 **1.9x~2.6x** sequential baseline，较 V4.2 单请求再提升 **1.6x~1.9x**
 
 **单 seq 路线剩余可选工程（小 ROI，+3~5%）**
 
@@ -1165,6 +1359,6 @@ V4.2 的额外价值是**为 V5 铺路**：draft batch decode shape 也固定（
 
 **结构档（真正有量级收益的方向）**
 
-1. **V5 batch SD**：按 §10.5 的 V5.0 → V5.1 → V5.2 roadmap 推进；绝对吞吐有望到 bs=1 baseline 的 20-30x
+1. **V5.1 / V5.2 batch SD**：从 fixed batch=2 同步 MVP 继续升级到任意 batch + 异步状态机 + Scheduler 融合
 2. **换更大 base（Qwen3-7B）**：在 4090D 上是可行的（§10.3），理论上限从 1.5x 推到 1.7x，配合 batch SD 是乘法关系
 3. **换 draft（EAGLE / MTP / 蒸馏）**：需要训练，暂不具备条件

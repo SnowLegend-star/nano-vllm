@@ -234,9 +234,81 @@ class SpeculativeLLM:
         seq.num_cached_tokens = seq.num_tokens
         return logits
 
+    def _next_logits_batch(
+        self,
+        engine: LLMEngine,
+        states: list[_SequenceState],
+    ) -> list:
+        """
+        V5.0: 批量版 next_logits。
+
+        同一批 state 里可能混有三种形态：
+        - 初次 prompt prefill
+        - decode (uncached == 1)
+        - prefix-cache prefill (uncached >= 2)
+
+        这里按形态分组后分别 batched forward，避免把 decode/prefill 混到一次
+        ModelRunner 调用里。
+        """
+        logits_by_state = [None] * len(states)
+        init_prefill_indices = []
+        decode_indices = []
+        multi_prefill_indices = []
+
+        for idx, state in enumerate(states):
+            seq = state.seq
+            if not state.prefilled:
+                init_prefill_indices.append(idx)
+                continue
+
+            uncached = seq.num_tokens - seq.num_cached_tokens
+            if uncached <= 0:
+                raise RuntimeError("_next_logits_batch called with no uncached token to advance.")
+            if uncached == 1:
+                decode_indices.append(idx)
+            else:
+                multi_prefill_indices.append(idx)
+
+        def _assign_logits(indices: list[int], logits, *, mode: str, init_prefill: bool = False):
+            if not indices:
+                return
+            if len(indices) == 1 and logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            for row, idx in enumerate(indices):
+                state = states[idx]
+                logits_by_state[idx] = logits[row]
+                if init_prefill:
+                    state.prefilled = True
+                state.seq.num_cached_tokens = state.seq.num_tokens
+
+        if init_prefill_indices:
+            seqs = [states[idx].seq for idx in init_prefill_indices]
+            logits = engine.model_runner.forward_logits(seqs, "prefill")
+            _assign_logits(init_prefill_indices, logits, mode="prefill", init_prefill=True)
+
+        if decode_indices:
+            block_manager = engine.scheduler.block_manager
+            for idx in decode_indices:
+                seq = states[idx].seq
+                if not block_manager.can_append(seq):
+                    raise RuntimeError("KV cache blocks are insufficient while advancing speculative decoding.")
+                block_manager.may_append(seq)
+            seqs = [states[idx].seq for idx in decode_indices]
+            logits = engine.model_runner.forward_logits(seqs, "decode")
+            _assign_logits(decode_indices, logits, mode="decode")
+
+        if multi_prefill_indices:
+            for idx in multi_prefill_indices:
+                self._grow_blocks_to_num_tokens(engine, states[idx].seq)
+            seqs = [states[idx].seq for idx in multi_prefill_indices]
+            logits = engine.model_runner.forward_logits(seqs, "prefill")
+            _assign_logits(multi_prefill_indices, logits, mode="prefill")
+
+        return logits_by_state
+
     @staticmethod
     def _greedy_from_logits(logits) -> int:
-        return int(logits[0].argmax(dim=-1).item())
+        return int(logits.argmax(dim=-1).reshape(-1)[0].item())
 
     @staticmethod
     def _sequence_finished(seq: Sequence, token_id: int, eos_token_id: int) -> bool:
@@ -249,6 +321,27 @@ class SpeculativeLLM:
             max_tokens=seq.max_tokens,
             ignore_eos=seq.ignore_eos,
         )
+
+    def _prompt_to_token_ids(self, prompt: str | list[int]) -> list[int]:
+        if isinstance(prompt, str):
+            return self.base_engine.tokenizer.encode(prompt)
+        return list(prompt)
+
+    def _build_output(
+        self,
+        state: _SequenceState,
+        accepted_tokens: int,
+        proposed_tokens: int,
+        resync_count: int,
+    ) -> dict:
+        return {
+            "text": self.base_engine.tokenizer.decode(state.seq.completion_token_ids),
+            "token_ids": list(state.seq.completion_token_ids),
+            "accepted_tokens": accepted_tokens,
+            "proposed_tokens": proposed_tokens,
+            "acceptance_rate": accepted_tokens / proposed_tokens if proposed_tokens else 0.0,
+            "resync_count": resync_count,
+        }
 
     def _truncate_sequence(self, engine: LLMEngine, state: _SequenceState, num_tokens: int):
         seq = state.seq
@@ -362,15 +455,241 @@ class SpeculativeLLM:
         finally:
             self._free_sequence(self.base_engine, verify_state)
 
+    def _propose_batch_with_draft(
+        self,
+        states: list[_SequenceState],
+        max_steps_per_state: list[int],
+    ) -> list[list[int]]:
+        if len(states) != len(max_steps_per_state):
+            raise ValueError("states and max_steps_per_state must have the same length.")
+
+        proposal_token_ids = [[] for _ in states]
+        stopped = [False] * len(states)
+        eos_token_id = self.draft_engine.scheduler.eos
+        max_steps = max(max_steps_per_state, default=0)
+
+        for _ in range(max_steps):
+            active_indices = [
+                idx for idx, state in enumerate(states)
+                if not stopped[idx] and len(proposal_token_ids[idx]) < max_steps_per_state[idx]
+            ]
+            if not active_indices:
+                break
+
+            active_states = [states[idx] for idx in active_indices]
+            logits_by_state = self._next_logits_batch(self.draft_engine, active_states)
+            for local_idx, idx in enumerate(active_indices):
+                token_id = self._greedy_from_logits(logits_by_state[local_idx])
+                states[idx].seq.append_token(token_id)
+                proposal_token_ids[idx].append(token_id)
+                if self._sequence_finished(states[idx].seq, token_id, eos_token_id):
+                    stopped[idx] = True
+
+        return proposal_token_ids
+
+    def _verify_batch_with_base(
+        self,
+        states: list[_SequenceState],
+        draft_token_ids_batch: list[list[int]],
+    ) -> tuple[list[_SequenceState], list[int], list[int | None]]:
+        if len(states) != len(draft_token_ids_batch):
+            raise ValueError("states and draft_token_ids_batch must have the same length.")
+        if not states:
+            return [], [], []
+        if len(states) == 1:
+            next_state, accepted_count, fallback_token_id = self._verify_with_base(
+                states[0],
+                draft_token_ids_batch[0],
+            )
+            return [next_state], [accepted_count], [fallback_token_id]
+
+        proposal_len = len(draft_token_ids_batch[0])
+        if proposal_len <= 0:
+            raise ValueError("batched verify requires non-empty draft_token_ids.")
+        if any(len(token_ids) != proposal_len for token_ids in draft_token_ids_batch):
+            raise ValueError("batched verify currently requires all draft_token_ids to have the same length.")
+
+        verify_states = []
+        try:
+            for state, draft_token_ids in zip(states, draft_token_ids_batch):
+                source_seq = state.seq
+                cached_prefix_tokens = max(0, source_seq.num_cached_tokens - 1)
+                target_tokens = list(source_seq.token_ids) + draft_token_ids
+                verify_states.append(
+                    self._fork_sequence_from_state(
+                        self.base_engine,
+                        state,
+                        target_tokens,
+                        cached_prefix_tokens=cached_prefix_tokens,
+                    )
+                )
+
+            verify_logits = self.base_engine.model_runner.forward_verify_logits(
+                [verify_state.seq for verify_state in verify_states],
+                "prefill",
+                num_logits_to_keep=proposal_len + 1,
+            )
+            if verify_logits.dim() == 2:
+                verify_logits = verify_logits.unsqueeze(0)
+            for verify_state in verify_states:
+                verify_state.seq.num_cached_tokens = verify_state.seq.num_tokens
+
+            next_states = []
+            accepted_counts = []
+            fallback_token_ids = []
+            for idx, (state, draft_token_ids) in enumerate(zip(states, draft_token_ids_batch)):
+                accepted_count, _, fallback_token_id = self.base_engine.model_runner.verify_draft_tokens(
+                    draft_token_ids,
+                    verify_logits[idx],
+                    include_bonus_token=True,
+                )
+                next_state = self._adopt_base_verify_state(
+                    state,
+                    verify_states[idx],
+                    accepted_count=accepted_count,
+                    fallback_token_id=fallback_token_id,
+                )
+                verify_states[idx] = None
+                next_states.append(next_state)
+                accepted_counts.append(accepted_count)
+                fallback_token_ids.append(fallback_token_id)
+
+            return next_states, accepted_counts, fallback_token_ids
+        finally:
+            for verify_state in verify_states:
+                self._free_sequence(self.base_engine, verify_state)
+
+    def _generate_batch2(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: list[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> list[dict]:
+        if len(prompts) != 2 or len(sampling_params) != 2:
+            raise ValueError("V5.0 generate_batch currently only supports exactly 2 prompts.")
+
+        prompt_token_ids_batch = [self._prompt_to_token_ids(prompt) for prompt in prompts]
+        base_states = [
+            self._make_sequence(self.base_engine, prompt_token_ids, sp)
+            for prompt_token_ids, sp in zip(prompt_token_ids_batch, sampling_params)
+        ]
+        draft_states = [
+            self._make_sequence(self.draft_engine, prompt_token_ids, sp)
+            for prompt_token_ids, sp in zip(prompt_token_ids_batch, sampling_params)
+        ]
+
+        proposed_tokens = [0, 0]
+        accepted_tokens = [0, 0]
+        resync_count = [0, 0]
+        finished = [False, False]
+        reported_finished = [False, False]
+        pbar = tqdm(total=2, desc="Speculative batch decoding", dynamic_ncols=True) if use_tqdm else None
+
+        def _mark_finished(idx: int):
+            finished[idx] = True
+            if pbar is not None and not reported_finished[idx]:
+                pbar.update(1)
+            reported_finished[idx] = True
+
+        try:
+            _ = self._next_logits_batch(self.base_engine, base_states)
+
+            while True:
+                for idx, state in enumerate(base_states):
+                    if finished[idx]:
+                        continue
+                    remaining = sampling_params[idx].max_tokens - state.seq.num_completion_tokens
+                    if remaining <= 0:
+                        _mark_finished(idx)
+
+                if all(finished):
+                    break
+
+                active_indices = [idx for idx in range(2) if not finished[idx]]
+                active_draft_states = [draft_states[idx] for idx in active_indices]
+                max_steps_per_state = [
+                    min(
+                        self.draft_length,
+                        sampling_params[idx].max_tokens - base_states[idx].seq.num_completion_tokens,
+                    )
+                    for idx in active_indices
+                ]
+                proposal_token_ids_batch = self._propose_batch_with_draft(
+                    active_draft_states,
+                    max_steps_per_state,
+                )
+
+                proposal_by_index = {}
+                for local_idx, idx in enumerate(active_indices):
+                    proposal_token_ids = proposal_token_ids_batch[local_idx]
+                    proposal_by_index[idx] = proposal_token_ids
+                    proposed_tokens[idx] += len(proposal_token_ids)
+
+                verify_groups: dict[int, list[int]] = {}
+                for idx in active_indices:
+                    proposal_len = len(proposal_by_index[idx])
+                    if proposal_len > 0:
+                        verify_groups.setdefault(proposal_len, []).append(idx)
+
+                if not verify_groups:
+                    break
+
+                for group_indices in verify_groups.values():
+                    next_states, accepted_counts, fallback_token_ids = self._verify_batch_with_base(
+                        [base_states[idx] for idx in group_indices],
+                        [proposal_by_index[idx] for idx in group_indices],
+                    )
+                    for local_idx, idx in enumerate(group_indices):
+                        accepted_count = accepted_counts[local_idx]
+                        fallback_token_id = fallback_token_ids[local_idx]
+                        proposal_token_ids = proposal_by_index[idx]
+                        base_states[idx] = next_states[local_idx]
+                        accepted_tokens[idx] += accepted_count
+
+                        if self._sequence_finished(
+                            base_states[idx].seq,
+                            base_states[idx].seq.last_token,
+                            self.base_engine.scheduler.eos,
+                        ):
+                            _mark_finished(idx)
+                            continue
+
+                        if fallback_token_id is None:
+                            continue
+
+                        is_partial_accept = accepted_count != len(proposal_token_ids)
+                        if is_partial_accept:
+                            resync_count[idx] += 1
+                            target_len = base_states[idx].seq.num_tokens - 1
+                            if target_len < draft_states[idx].seq.num_tokens:
+                                self._truncate_sequence(self.draft_engine, draft_states[idx], target_len)
+                            draft_states[idx].seq.append_token(fallback_token_id)
+                        else:
+                            draft_states[idx].seq.append_token(fallback_token_id)
+
+            return [
+                self._build_output(
+                    base_states[idx],
+                    accepted_tokens[idx],
+                    proposed_tokens[idx],
+                    resync_count[idx],
+                )
+                for idx in range(2)
+            ]
+        finally:
+            if pbar is not None:
+                pbar.close()
+            for state in base_states:
+                self._free_sequence(self.base_engine, state)
+            for state in draft_states:
+                self._free_sequence(self.draft_engine, state)
+
     def _generate_one(
         self,
         prompt: str | list[int],
         sampling_params: SamplingParams,
     ) -> dict:
-        if isinstance(prompt, str):
-            prompt_token_ids = self.base_engine.tokenizer.encode(prompt)
-        else:
-            prompt_token_ids = prompt
+        prompt_token_ids = self._prompt_to_token_ids(prompt)
 
         base_state = self._make_sequence(self.base_engine, prompt_token_ids, sampling_params)
         draft_state = self._make_sequence(self.draft_engine, prompt_token_ids, sampling_params)
@@ -430,14 +749,12 @@ class SpeculativeLLM:
                         # 把两者 KV 都算完，比 V4.0 额外 decode 一次再 append 要便宜。
                         draft_state.seq.append_token(fallback_token_id)
 
-            return {
-                "text": self.base_engine.tokenizer.decode(base_state.seq.completion_token_ids),
-                "token_ids": list(base_state.seq.completion_token_ids),
-                "accepted_tokens": accepted_tokens,
-                "proposed_tokens": proposed_tokens,
-                "acceptance_rate": accepted_tokens / proposed_tokens if proposed_tokens else 0.0,
-                "resync_count": resync_count,
-            }
+            return self._build_output(
+                base_state,
+                accepted_tokens,
+                proposed_tokens,
+                resync_count,
+            )
         finally:
             self._free_sequence(self.base_engine, base_state)
             self._free_sequence(self.draft_engine, draft_state)
@@ -459,3 +776,13 @@ class SpeculativeLLM:
         for prompt, sp in iterator:
             outputs.append(self._generate_one(prompt, sp))
         return outputs
+
+    def generate_batch(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> list[dict]:
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        return self._generate_batch2(prompts, sampling_params, use_tqdm=use_tqdm)
