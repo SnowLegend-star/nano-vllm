@@ -15,17 +15,22 @@ class _SequenceState:
 
 class SpeculativeLLM:
     """
-    Speculative decoding (V4.0)。
+    Speculative decoding (V4.1)。
 
-    每轮 base 只做一次 fused prefill(k+1)：
+    Base 侧（沿用 V4.0 fused verify）：
+    - 每轮只做一次 prefill(k+1)
     - 输入 `[t_{n-1}, d_1, ..., d_k]`，共 k+1 个 query 位置
     - 输出 `[q_0, q_1, ..., q_k]`
     - `q_i` (i=0..k-1) 用来判决 `d_{i+1}`
     - 全部接受时 `argmax(q_k)` 直接作为 bonus token（greedy 语义）
 
-    这样相比 V3 的「decode 拿 q0 + prefill 拿 q1..qk」两段式前向：
-    - 每轮 base 的 CUDA launch 次数从 2 压到 1
-    - 全接受时顺带拿到一个真正的 bonus token
+    Draft 侧（V4.1 新增优化）：
+    - Case C（全接受 + bonus）不再额外 decode 一次来「固化 d_k 的 KV」。
+    - 改为直接 `append_token(bonus)`，让 draft 末尾保留 2 个 uncached token
+      (d_k 和 bonus)。下一轮 propose 的第一次 `_next_logits` 会自动走
+      prefix-cache prefill，一次性把这两个 token 的 KV 都补齐。
+    - 相比 V4.0 每次 Case C 要多一次 decode kernel launch，V4.1 把它合进了
+      下一轮的那个 prefill 里，Case C 的 draft 侧开销净减一次前向。
     """
 
     def __init__(
@@ -156,20 +161,77 @@ class SpeculativeLLM:
         if seq.block_table or seq.prefix_block_table or seq.pending_recompute_block_ids:
             engine.scheduler.block_manager.deallocate(seq)
 
+    @staticmethod
+    def _grow_blocks_to_num_tokens(engine: LLMEngine, seq: Sequence):
+        """
+        保证 seq.block_table 覆盖 seq.num_tokens 个 token 所需的块数，并把
+        任何已被填满的 block 补上 rolling hash。
+
+        用于「一次 append 了 >=2 个 token 还没算过 KV」的场景（V4.1 里的 Case C
+        走 prefix-cache prefill 前必须先把 block 槽位备好）。没有这个步骤的话，
+        后续若再走 decode 路径，`block_manager.may_append` 的
+        `assert last_block.hash != -1` 断言会直接炸。
+        """
+        block_manager = engine.scheduler.block_manager
+        need_new = seq.num_blocks - len(seq.block_table)
+        if need_new < 0:
+            return
+        if need_new > 0 and len(block_manager.free_block_ids) < need_new:
+            raise RuntimeError("KV cache blocks are insufficient while growing speculative sequence.")
+
+        for _ in range(need_new):
+            block_id = block_manager.free_block_ids[0]
+            block_manager._allocate_block(block_id)
+            seq.block_table.append(block_id)
+
+        # 把所有已填满但尚未 hash 的 block 补上滚动哈希，维持 BlockManager 的
+        # 核心不变量：「除了最后一个 block，其它 block 都必须 hash != -1」。
+        num_full = seq.num_tokens // seq.block_size
+        prev_hash = -1
+        for logical_id in range(num_full):
+            block = block_manager.blocks[seq.block_table[logical_id]]
+            if block.hash != -1:
+                prev_hash = block.hash
+                continue
+            token_ids = seq.block(logical_id)
+            prev_hash = block_manager.compute_hash(token_ids, prev_hash)
+            block.update(prev_hash, token_ids)
+            block_manager.hash_to_block_id[prev_hash] = seq.block_table[logical_id]
+
     def _next_logits(self, engine: LLMEngine, state: _SequenceState):
-        '''获取下一个token的logits, 有Prefill和Decode两种情况'''
+        """
+        返回「基于当前 seq 末尾上下文预测下一个 token 的 logits」。
+
+        路径分支（按未算 KV 的 token 数分）：
+        - 初次调用: 走 prefill, 建立 prompt KV。
+        - uncached == 1: 走 decode 快路径（单 token, 可吃 CUDA Graph）。
+        - uncached >= 2: 走 prefix-cache prefill, 一次性把多个未算 token 的 KV
+          全部写回, 并取最后位置的 logits 作为下一个 token 的预测。
+          这是 V4.1 为了消灭 Case C dummy decode 引入的路径。
+        """
+        seq = state.seq
         if not state.prefilled:
-            logits = engine.model_runner.forward_logits([state.seq], "prefill")
+            logits = engine.model_runner.forward_logits([seq], "prefill")
             state.prefilled = True
-            state.seq.num_cached_tokens = state.seq.num_tokens
+            seq.num_cached_tokens = seq.num_tokens
             return logits
 
+        uncached = seq.num_tokens - seq.num_cached_tokens
+        if uncached <= 0:
+            raise RuntimeError("_next_logits called with no uncached token to advance.")
+
         block_manager = engine.scheduler.block_manager
-        if not block_manager.can_append(state.seq):
-            raise RuntimeError("KV cache blocks are insufficient while advancing speculative decoding.")
-        block_manager.may_append(state.seq)
-        logits = engine.model_runner.forward_logits([state.seq], "decode")
-        state.seq.num_cached_tokens = state.seq.num_tokens
+        if uncached == 1:
+            if not block_manager.can_append(seq):
+                raise RuntimeError("KV cache blocks are insufficient while advancing speculative decoding.")
+            block_manager.may_append(seq)
+            logits = engine.model_runner.forward_logits([seq], "decode")
+        else:
+            # 多 token 未算 KV: 走 prefix-cache prefill
+            self._grow_blocks_to_num_tokens(engine, seq)
+            logits = engine.model_runner.forward_logits([seq], "prefill")
+
+        seq.num_cached_tokens = seq.num_tokens
         return logits
 
     @staticmethod
@@ -362,11 +424,10 @@ class SpeculativeLLM:
                             self._truncate_sequence(self.draft_engine, draft_state, target_len)
                         draft_state.seq.append_token(fallback_token_id)
                     else:
-                        # Case C (全接受 + bonus)：d_k 的 KV 还没进 cache，
-                        # 如果直接 append bonus，下一轮 decode 只会算 bonus 的 KV，d_k 的 KV 永远缺失。
-                        # 这里先让 draft 跑一次 decode 固化 d_k 的 KV（logits 用不到直接丢弃），
-                        # 然后再 append bonus，下一轮 decode 会自然补算 bonus 的 KV。
-                        _ = self._next_logits(self.draft_engine, draft_state)
+                        # Case C (全接受 + bonus)：V4.1 优化——直接 append bonus 就够了。
+                        # 此时 draft 末尾有两个 uncached token (d_k 和 bonus), 下一轮
+                        # propose 的第一次 _next_logits 会自动走 prefix-cache prefill 一次性
+                        # 把两者 KV 都算完，比 V4.0 额外 decode 一次再 append 要便宜。
                         draft_state.seq.append_token(fallback_token_id)
 
             return {
