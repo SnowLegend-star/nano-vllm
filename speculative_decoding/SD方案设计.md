@@ -70,8 +70,9 @@ def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
 | V4.0 | fused q0 + verify | 每轮 base 只做一次 prefill(k+1)，全接受自动吃 bonus | 已被替代 |
 | V4.1 | 消灭 Case C dummy decode | draft 侧多 uncached token 走 prefix-cache prefill，一次算完 `[d_k, bonus]` | 已被替代 |
 | V4.2 | draft CUDA Graph + graph-friendly `store_kvcache` | 重写 `store_kvcache` 去掉 host sync，顺势打通 draft bs=1 CUDA Graph | 已被替代 |
-| V5.0 | fixed batch=2 同步 MVP | 新增独立 `generate_batch()`，draft propose / base verify 都真正 batched | **当前版本** |
-| V5.1+ 目标 | 异步 Batch SD | 多 request 动态 batching，共享 base verify，真正把绝对吞吐拉起来 | 规划中 |
+| V5.0 | fixed batch=2 同步 MVP | 新增独立 `generate_batch()`，draft propose / base verify 都真正 batched | 已被替代 |
+| V5.1 | 任意 batch + 外层异步状态机 | request-level FSM + 动态 batching，GPU 前向仍串行 launch | **当前版本** |
+| V5.2+ 目标 | Scheduler 融合 | 把异步 batch SD 纳入原生调度与 KV 生命周期管理 | 规划中 |
 
 后面每一节会按「目标 / 主要改动 / 时序图（可选）/ 性能观察 / 剩余问题」五个维度讲。
 
@@ -1048,15 +1049,15 @@ DRAFT_KWARGS = {
 
 | prompt | base tok/s | k=2 tok/s | speedup | accept | resync | accepted/proposed | k=3 tok/s | speedup | accept | resync | accepted/proposed |
 |---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
-| think_long | 24.13 | 32.05 | 1.33x | 0.637 | 26 | 72/113 | 39.53 | 1.64x | 0.500 | 36 | 77/154 |
-| short_qa | 27.33 | 34.91 | 1.28x | 0.673 | 24 | 74/110 | 37.27 | 1.36x | 0.534 | 32 | 79/148 |
-| factual_list | 27.90 | 33.02 | 1.18x | 0.545 | 35 | 67/123 | 37.59 | 1.35x | 0.469 | 36 | 75/160 |
-| template_code | 27.70 | 35.11 | 1.27x | 0.673 | 23 | 74/110 | 41.53 | 1.50x | 0.606 | 24 | 83/137 |
-| casual_chat | 27.65 | 33.23 | 1.20x | 0.562 | 32 | 68/121 | 39.39 | 1.42x | 0.537 | 30 | 79/147 |
+| think_long | 24.18 | 32.05 | 1.33x | 0.637 | 26 | 72/113 | 39.36 | 1.63x | 0.500 | 36 | 77/154 |
+| short_qa | 27.77 | 35.01 | 1.26x | 0.673 | 24 | 74/110 | 37.55 | 1.35x | 0.534 | 32 | 79/148 |
+| factual_list | 27.79 | 33.01 | 1.19x | 0.545 | 35 | 67/123 | 37.33 | 1.34x | 0.469 | 36 | 75/160 |
+| template_code | 27.78 | 34.88 | 1.26x | 0.673 | 23 | 74/110 | 41.61 | 1.50x | 0.606 | 24 | 83/137 |
+| casual_chat | 27.82 | 32.94 | 1.18x | 0.562 | 32 | 68/121 | 39.73 | 1.43x | 0.537 | 30 | 79/147 |
 
 这次完整归档的几个要点：
 
-- **k=2 平均 speedup ≈ 1.25x**
+- **k=2 平均 speedup ≈ 1.24x**
 - **k=3 平均 speedup ≈ 1.45x**
 - acceptance / resync / accepted-proposed 与前一轮 V4.2 归档**基本一致**
 - 波动主要来自**baseline 绝对 tok/s 的运行时漂移**（warmup、allocator 状态、driver 波动等），不是 speculative 控制流变了
@@ -1143,7 +1144,7 @@ V4.2 的额外价值是**为 V5 铺路**：draft batch decode shape 也固定（
 - [x] Graph capture 失败时 `[WARNING]` fallback 生效（测试：临时改 `store_kvcache` 加一次 `.item()` 模拟失败）
 - [x] `run_test.py` 的 baseline 同样受益（eager 路径也走新版 `store_kvcache`）
 
-## 12. V5.0：fixed batch=2 同步 MVP（当前版本）
+## 12. V5.0：fixed batch=2 同步 MVP（已被替代）
 
 V4.2 把单 seq speculative decoding 做到 1.4x+ 之后，下一步已经不是再抠单轮几十微秒，而是把**两个请求一起跑**，让 draft propose 和 base verify 都真正吃到 batch。V5.0 的目标不是一次做成 production 级异步 batch SD，而是先验证：**在不碰原生 Scheduler 的前提下，只靠 `SpeculativeLLM` 上层状态机，能不能把吞吐再拉一截。**
 
@@ -1279,6 +1280,226 @@ V5.0 之后，路线比之前更清楚了：
 
 从 ROI 来看，V5.0 已经把“batch 这条线值得做”从理论判断变成了实测结论。
 
+## 13. V5.1：任意 batch + 外层异步状态机（当前版本）
+
+V5.0 已经证明了“把多条请求一起 verify / propose”是有用的，但它仍然被两个限制卡住：
+
+- 只能 fixed `batch=2`
+- 整个 batch 按**同步轮次**推进，只要其中一条请求提前 EOS / proposal 更短，就会产生 bubble
+
+V5.1 的目标就是把这两个限制拆掉，同时**不提前碰 `Scheduler`**。换句话说，这一版做的是：
+
+- request-level 状态机
+- 动态 batching
+- GPU 前向仍然串行 launch
+
+它不是 production 级调度器，但已经从“同步 proof-of-concept”进入“可扩展的外层 orchestrator”阶段。
+
+### 13.1 核心设计
+
+#### 13.1.1 request-level 状态对象
+
+`nanovllm/speculative_llm.py` 新增 `_BatchRequestState`，把一条请求在 batch speculative decoding 里的完整生命周期收口到一个对象里：
+
+- `base: _SequenceState`
+- `draft: _SequenceState`
+- `request_id`
+- `phase`
+- `proposal_token_ids`
+- `proposal_limit`
+- `accepted_tokens / proposed_tokens / resync_count`
+- `output_ready`
+
+这里的关键不是“多一个 dataclass”，而是**把 V5.0 里散落在多个并行 list 里的状态显式化**。只有这样，V5.1 才能允许：
+
+- A 请求在 `verify_ready`
+- B / C 请求仍在 `drafting`
+- D 请求已经 `finished`
+
+而不再强制“大家同进同出一轮”。
+
+#### 13.1.2 状态异步，前向串行
+
+V5.1 的调度原则是：
+
+- 不同请求的 **phase 可以不同**
+- 但同一时刻只发起**一个** batched GPU forward
+
+这也是为什么 V5.1 先不碰 `Scheduler` / 多 stream / 全局 `Context`。当前代码里 `attention` 依赖模块级 `set_context()/reset_context()`，如果上来就做真并发前向，复杂度会一下跳到 V5.2 甚至更高。
+
+所以 V5.1 选择的路线是：**先把“状态机异步”做好，GPU launch 仍保持串行。**
+
+### 13.2 调度模型
+
+V5.1 的 batch loop 不再是：
+
+- 所有活跃请求一起 draft 满一轮
+- 再一起 verify
+
+而是改成“每次选当前最值得做的一批”：
+
+```mermaid
+flowchart TD
+    init[initRequests] --> prefill[prefillAllBasePrompts]
+    prefill --> mainLoop[asyncBatchLoop]
+    mainLoop --> hasVerify{"any verify_ready?"}
+    hasVerify -->|yes| pickVerify[pickLargestVerifyGroup]
+    hasVerify -->|no| pickDraft[pickAllDraftingRequests]
+    pickVerify --> verify[runOneVerifyBatch]
+    pickDraft --> draft[runOneDraftStepBatch]
+    verify --> update[perRequestCommitAndResync]
+    draft --> phaseUpdate[updatePhaseToVerifyReadyIfNeeded]
+    update --> doneCheck{all finished?}
+    phaseUpdate --> doneCheck
+    doneCheck -->|no| mainLoop
+    doneCheck -->|yes| collect[collectOutputs]
+```
+
+两个关键点：
+
+1. **verify 优先**
+   - 一旦某条 request 已经拿到了 proposal，先尽快提交到 base
+   - 这样能更早释放它的“本轮挂起状态”，减少 proposal 在 request 池里堆积
+
+2. **draft 改成一步一调度**
+   - 不再像 V5.0 那样“同一批 request 一口气 draft 到 `k`”
+   - 而是每次只推进 **一个 batched draft step**
+   - 谁先达到 `proposal_limit` 或 EOS，就先转成 `verify_ready`
+
+这就是 V5.1 “异步状态机”的实质：**不是 GPU 并发，而是 phase 不再锁步。**
+
+### 13.3 关键代码改动
+
+#### 13.3.1 `generate_batch()` 支持任意 batch
+
+`generate_batch()` 不再限制 `len(prompts) == 2`，而是交给新的 `_generate_batch2()`（名字沿用，但语义已经变成 V5.1 异步版）处理任意 batch。
+
+#### 13.3.2 新增批调度 helper
+
+`nanovllm/speculative_llm.py` 新增或重构了几类 helper：
+
+- `_prepare_batch_requests()`
+- `_start_new_draft_round()`
+- `_select_verify_batch()`
+- `_draft_one_step()`
+- `_run_verify_batch()`
+- `_apply_verify_result()`
+- `_free_batch_requests()`
+
+这些 helper 的设计原则是：
+
+- batched 的只是 `forward_logits` / `forward_verify_logits`
+- 接受/拒绝与 resync 仍然按 request 逐条提交
+- 注释只写“为什么这一步这么调度”，不写显而易见的语法解释
+
+#### 13.3.3 verify 仍然按 proposal 长度分组
+
+V5.1 虽然已经任意 batch + 异步 phase 了，但 verify 这层还保留一个约束：
+
+- **同一次 verify batch 内，`proposal_len` 必须一致**
+
+原因不是状态机偷懒，而是当前 `forward_verify_logits(..., num_logits_to_keep=k+1)` 的 batched 切片接口仍然天然按“同批同 K”设计。  
+所以 V5.1 的 `_select_verify_batch()` 会：
+
+- 先筛出所有 `verify_ready` 请求
+- 按 `len(proposal_token_ids)` 分组
+- 优先选择**batch 最大**的那组
+- 若 batch size 一样，则选 proposal 更长的一组
+
+这相当于在接口约束不变的前提下，把每次 verify forward 的 ROI 尽量拉满。
+
+### 13.4 实测结果（`run_batch_test.py`）
+
+V5.1 的 benchmark 改成了**任意 batch**：
+
+- `batch4_mixed`：4 条不同风格 prompt 混合
+- `batch3_short`：3 条较短 / 较模式化 prompt
+
+配置：
+
+- baseline：4B 单模型，顺序 serving 整个 batch
+- single speculative：沿用单请求 `generate()`，顺序处理整个 batch
+- dynamic batch speculative：V5.1 `generate_batch()`
+- draft 继续开 CUDA Graph，`cudagraph_max_bs = 4`
+
+| batch | size | base tok/s | single k=2 | dynamic k=2 | single k=3 | dynamic k=3 |
+|---|---:|---:|---:|---:|---:|---:|
+| batch4_mixed | 4 | 26.80 | 34.64 | **105.86** | 40.64 | **115.10** |
+| batch3_short | 3 | 28.07 | 35.11 | **83.53** | 41.39 | **98.08** |
+
+换成 speedup（相对 sequential baseline）：
+
+| batch | single k=2 | dynamic k=2 | single k=3 | dynamic k=3 |
+|---|---:|---:|---:|---:|
+| batch4_mixed | 1.29x | **3.95x** | 1.52x | **4.29x** |
+| batch3_short | 1.25x | **2.98x** | 1.47x | **3.49x** |
+
+这组数据说明三件事：
+
+1. **V5.1 相比 V5.0 再上了一个量级**
+   - V5.0 的 batch=2 同步 MVP 是 `~1.9x-2.6x`
+   - V5.1 任意 batch + 异步 phase 已经来到 `~3.0x-4.3x`
+
+2. **batch 越大，异步状态机的收益越明显**
+   - `batch4_mixed` 明显高于 `batch3_short`
+   - 说明 bubble 被动态 batching 吃掉之后，更多 request 确实能更好摊薄 verify / draft 的固定开销
+
+3. **`k=3` 依然系统性优于 `k=2`**
+   - 这意味着 V4.2 打下来的“draft 成本足够低”这个前提，在 V5.1 里仍然成立
+
+#### 13.4.1 单请求 vs 动态 batch 总表
+
+为了把“当前单请求上限”和“V5.1 动态 batch”的量级差距放到一张表里，这里把：
+
+- `run_test.py` 的**最新单请求归档**
+- `run_batch_test.py` 的 **V5.1 动态 batch** 数据
+
+并排整理如下。
+
+> 注意：这张表的 workload **并不完全相同**。  
+> `run_test.py` 是 5 个单请求 prompt 的平均；`run_batch_test.py` 是 3/4 条请求的混合 batch。  
+> 所以它更适合看“量级差距”和“路线收益”，而不是做严格的同 prompt apples-to-apples 对比。
+
+| 场景 | workload | batch size | baseline tok/s | k=2 tok/s | k=2 speedup | k=3 tok/s | k=3 speedup |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 单请求 (`run_test.py`) | `prompt_suite` 平均 | 1 | 27.07 | 33.58 | 1.24x | 39.12 | 1.45x |
+| 动态 batch (`run_batch_test.py`) | `batch3_short` | 3 | 28.07 | 83.53 | 2.98x | 98.08 | 3.49x |
+| 动态 batch (`run_batch_test.py`) | `batch4_mixed` | 4 | 26.80 | 105.86 | 3.95x | 115.10 | 4.29x |
+
+这张总表最值得记住的只有两句话：
+
+1. **V4.2 已经把单请求 speculative decoding 做到 1.2x~1.5x 这个比较健康的区间**
+2. **真正的数量级提升还是来自 batch**：V5.1 一旦进入 `batch=3/4`，speedup 立刻抬到 `3x~4.3x`
+
+也就是说，V4.2 解决的是“单请求终于值得开 SD 了”，而 V5.1 证明的是“batch 才是吞吐真正爆发的地方”。
+
+### 13.5 正确性与当前定位
+
+V5.1 做了两类 sanity check：
+
+- `batch=3 / batch=4` 能稳定跑完，不再受 fixed batch=2 限制
+- 短生成下，`generate_batch()` 与逐条 `generate()` 在 token / accepted / proposed 上可对齐
+
+不过这一版依然要诚实地称为**外层 orchestrator 版本**，而不是最终系统形态。原因有三：
+
+1. 还没和原生 `Scheduler` 融合
+2. verify 仍然要求同批 `proposal_len` 一致
+3. GPU launch 仍然串行；V5.1 解决的是“状态锁步”问题，不是“前向并发”问题
+
+因此 V5.1 的定位可以概括成一句话：
+
+**把 batch SD 从“同步 MVP”推进到了“可扩展的 request-level 动态调度器”，但还没进到引擎内核。**
+
+### 13.6 对 V5.2 的直接启发
+
+V5.1 落地之后，V5.2 的难点被进一步暴露出来了：
+
+- 要不要把 `phase` / `proposal_token_ids` / `proposal_limit` 抽成引擎级 request metadata
+- 要不要把 `verify_ready` / `drafting` 的选择权交给 `Scheduler`
+- 要不要把全局 `Context` 改成可重入 / per-forward 上下文
+
+也就是说，V5.1 的意义不只是再拿一轮 throughput，而是把 **V5.2 真正难的边界** 先在外层 orchestrator 里跑出来。
+
 ## 附录 A：已解决的历史问题
 
 ### A.1 accepted draft token 没同步回 `base_state` 的 KV cache
@@ -1331,10 +1552,11 @@ V5.0 之后，路线比之前更清楚了：
 
 ## 附录 C：当前仍然存在的限制
 
-- `SpeculativeLLM` 只有 fixed batch=2 的同步 batch API，还没有任意 batch / 异步 batch SD
-- 还没有和原生 `Scheduler` 融合
-- 还没把 draft / base 的状态抽成独立 `ModelCacheState`
+- `SpeculativeLLM` 已支持任意 batch + 外层异步状态机，但还没有和原生 `Scheduler` 融合
+- batched verify 仍然要求同批 `proposal_len` 一致，不同长度只能拆 group
+- 还没把 draft / base 的状态抽成真正独立的 `ModelCacheState`
 - `draft_length` 只支持固定值，没做按 acceptance rate 自适应
+- GPU 前向仍然串行 launch，没有做多 stream / 真并发
 
 ## 附录 D：下一步计划
 
@@ -1348,6 +1570,8 @@ V5.0 之后，路线比之前更清楚了：
 - **结果**：k=3 从 0.72x → 1.47x 平均，首次稳定突破 1.0x
 - V5.0 fixed batch=2 同步 MVP：新增 `generate_batch()`，draft propose / base verify 都真正 batched
 - **结果**：batch=2 总吞吐达到 **1.9x~2.6x** sequential baseline，较 V4.2 单请求再提升 **1.6x~1.9x**
+- V5.1 任意 batch + 外层异步状态机：request-level FSM + 动态 batching，GPU 前向仍串行 launch
+- **结果**：动态 batch 吞吐达到 **3.0x~4.3x** sequential baseline，明显高于 V5.0 的同步 batch=2
 
 **单 seq 路线剩余可选工程（小 ROI，+3~5%）**
 
@@ -1359,6 +1583,6 @@ V5.0 之后，路线比之前更清楚了：
 
 **结构档（真正有量级收益的方向）**
 
-1. **V5.1 / V5.2 batch SD**：从 fixed batch=2 同步 MVP 继续升级到任意 batch + 异步状态机 + Scheduler 融合
+1. **V5.2 batch SD**：把 V5.1 的外层 orchestrator 纳入 Scheduler / BlockManager / request lifecycle
 2. **换更大 base（Qwen3-7B）**：在 4090D 上是可行的（§10.3），理论上限从 1.5x 推到 1.7x，配合 batch SD 是乘法关系
 3. **换 draft（EAGLE / MTP / 蒸馏）**：需要训练，暂不具备条件

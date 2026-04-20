@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from tqdm.auto import tqdm
 
@@ -11,6 +11,33 @@ from nanovllm.sampling_params import SamplingParams
 class _SequenceState:
     seq: Sequence
     prefilled: bool = False
+
+
+@dataclass
+class _BatchRequestState:
+    """
+    V5.1: 每个 request 的权威状态。
+
+    和 V5.0 把状态散落在多个并行 list 里不同，这里把一条请求在 batch
+    speculative decoding 中的完整生命周期收敛到一个对象里，方便做异步 phase
+    迁移（drafting -> verify_ready -> finished）。
+    """
+
+    request_id: int
+    sampling_params: SamplingParams
+    base: _SequenceState
+    draft: _SequenceState
+    phase: str = "drafting"
+    proposal_token_ids: list[int] = field(default_factory=list)
+    proposal_limit: int = 0
+    accepted_tokens: int = 0
+    proposed_tokens: int = 0
+    resync_count: int = 0
+    output_ready: bool = False
+
+    @property
+    def is_finished(self) -> bool:
+        return self.phase == "finished"
 
 
 class SpeculativeLLM:
@@ -343,6 +370,118 @@ class SpeculativeLLM:
             "resync_count": resync_count,
         }
 
+    def _build_request_output(self, request: _BatchRequestState) -> dict:
+        return self._build_output(
+            request.base,
+            request.accepted_tokens,
+            request.proposed_tokens,
+            request.resync_count,
+        )
+
+    def _remaining_tokens(self, request: _BatchRequestState) -> int:
+        return request.sampling_params.max_tokens - request.base.seq.num_completion_tokens
+
+    def _mark_request_finished(self, request: _BatchRequestState):
+        request.phase = "finished"
+        request.output_ready = True
+        request.proposal_limit = 0
+        request.proposal_token_ids.clear()
+
+    def _start_new_draft_round(self, request: _BatchRequestState):
+        """
+        每次 verify 提交完成后都从这里进入下一轮 drafting。
+
+        这样可以把「清 proposal 缓存 / 重新计算本轮 draft budget / 检查是否已经结束」
+        的逻辑收口到一个地方，避免不同状态转移分支漏掉边界条件。
+        """
+        if self._sequence_finished(
+            request.base.seq,
+            request.base.seq.last_token,
+            self.base_engine.scheduler.eos,
+        ):
+            self._mark_request_finished(request)
+            return
+
+        remaining = self._remaining_tokens(request)
+        if remaining <= 0:
+            self._mark_request_finished(request)
+            return
+
+        request.phase = "drafting"
+        request.proposal_token_ids.clear()
+        request.proposal_limit = min(self.draft_length, remaining)
+
+    def _prepare_batch_requests(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: list[SamplingParams],
+    ) -> list[_BatchRequestState]:
+        prompt_token_ids_batch = [self._prompt_to_token_ids(prompt) for prompt in prompts]
+        base_states = [
+            self._make_sequence(self.base_engine, prompt_token_ids, sp)
+            for prompt_token_ids, sp in zip(prompt_token_ids_batch, sampling_params)
+        ]
+        draft_states = [
+            self._make_sequence(self.draft_engine, prompt_token_ids, sp)
+            for prompt_token_ids, sp in zip(prompt_token_ids_batch, sampling_params)
+        ]
+        requests = [
+            _BatchRequestState(
+                request_id=idx,
+                sampling_params=sp,
+                base=base_state,
+                draft=draft_state,
+            )
+            for idx, (sp, base_state, draft_state) in enumerate(zip(sampling_params, base_states, draft_states))
+        ]
+
+        # base prompt prefill 可以天然 batched；做完这一轮之后，后续每条 request
+        # 再独立进入自己的 draft/verify phase。
+        _ = self._next_logits_batch(self.base_engine, [request.base for request in requests])
+        for request in requests:
+            self._start_new_draft_round(request)
+        return requests
+
+    @staticmethod
+    def _group_requests_by_proposal_len(
+        requests: list[_BatchRequestState],
+    ) -> dict[int, list[_BatchRequestState]]:
+        grouped_requests: dict[int, list[_BatchRequestState]] = {}
+        for request in requests:
+            grouped_requests.setdefault(len(request.proposal_token_ids), []).append(request)
+        return grouped_requests
+
+    def _select_verify_batch(
+        self,
+        requests: list[_BatchRequestState],
+    ) -> list[_BatchRequestState]:
+        verify_ready_requests = [request for request in requests if request.phase == "verify_ready"]
+        if not verify_ready_requests:
+            return []
+
+        grouped_requests = self._group_requests_by_proposal_len(verify_ready_requests)
+
+        # V5.1 仍然受「同一批 verify 的 proposal_len 必须一致」约束。
+        # 这里优先选“同长度里 batch 最大”的那组，这样能最大化每次 verify forward
+        # 的吞吐；若 batch size 相同，则优先更长的 proposal_len，摊薄一次 verify
+        # 前向的固定开销。
+        _, selected_requests = max(
+            grouped_requests.items(),
+            key=lambda item: (len(item[1]), item[0]),
+        )
+        return selected_requests
+
+    @staticmethod
+    def _drafting_requests(
+        requests: list[_BatchRequestState],
+    ) -> list[_BatchRequestState]:
+        return [request for request in requests if request.phase == "drafting"]
+
+    def _free_batch_requests(self, requests: list[_BatchRequestState]):
+        for request in requests:
+            self._free_sequence(self.base_engine, request.base)
+            self._free_sequence(self.draft_engine, request.draft)
+
     def _truncate_sequence(self, engine: LLMEngine, state: _SequenceState, num_tokens: int):
         seq = state.seq
         if num_tokens >= seq.num_tokens:
@@ -559,130 +698,143 @@ class SpeculativeLLM:
             for verify_state in verify_states:
                 self._free_sequence(self.base_engine, verify_state)
 
+    def _draft_one_step(
+        self,
+        requests: list[_BatchRequestState],
+    ):
+        if not requests:
+            return
+
+        logits_by_state = self._next_logits_batch(
+            self.draft_engine,
+            [request.draft for request in requests],
+        )
+        eos_token_id = self.draft_engine.scheduler.eos
+
+        for request, logits in zip(requests, logits_by_state):
+            token_id = self._greedy_from_logits(logits)
+            request.draft.seq.append_token(token_id)
+            request.proposal_token_ids.append(token_id)
+            request.proposed_tokens += 1
+
+            # draft 侧一旦达到本轮 budget，或者草稿模型自己触发 EOS/max_tokens，
+            # 该 request 就从 drafting 转入 verify_ready；其它 request 可以继续
+            # 留在 drafting，下一次再和别的同 phase 请求一起组 batch。
+            if (
+                len(request.proposal_token_ids) >= request.proposal_limit
+                or self._sequence_finished(request.draft.seq, token_id, eos_token_id)
+            ):
+                request.phase = "verify_ready"
+
+    def _apply_verify_result(
+        self,
+        request: _BatchRequestState,
+        next_base_state: _SequenceState,
+        accepted_count: int,
+        fallback_token_id: int | None,
+    ):
+        proposal_len = len(request.proposal_token_ids)
+        request.base = next_base_state
+        request.accepted_tokens += accepted_count
+
+        if request.is_finished:
+            return
+
+        if fallback_token_id is not None:
+            is_partial_accept = accepted_count != proposal_len
+            if is_partial_accept:
+                request.resync_count += 1
+                target_len = request.base.seq.num_tokens - 1
+                if target_len < request.draft.seq.num_tokens:
+                    self._truncate_sequence(self.draft_engine, request.draft, target_len)
+                request.draft.seq.append_token(fallback_token_id)
+            else:
+                request.draft.seq.append_token(fallback_token_id)
+
+        # verify 已经把这一轮的 proposal 消耗完了，接下来是否继续 drafting
+        # 只取决于 base 的真实状态，而不取决于其它 request 现在处在哪个 phase。
+        self._start_new_draft_round(request)
+
+    def _run_verify_batch(
+        self,
+        requests: list[_BatchRequestState],
+    ):
+        if not requests:
+            return
+
+        next_states, accepted_counts, fallback_token_ids = self._verify_batch_with_base(
+            [request.base for request in requests],
+            [list(request.proposal_token_ids) for request in requests],
+        )
+        for request, next_state, accepted_count, fallback_token_id in zip(
+            requests,
+            next_states,
+            accepted_counts,
+            fallback_token_ids,
+        ):
+            self._apply_verify_result(
+                request,
+                next_state,
+                accepted_count,
+                fallback_token_id,
+            )
+
     def _generate_batch2(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict]:
-        if len(prompts) != 2 or len(sampling_params) != 2:
-            raise ValueError("V5.0 generate_batch currently only supports exactly 2 prompts.")
+        if len(prompts) != len(sampling_params):
+            raise ValueError("prompts and sampling_params must have the same length.")
+        if not prompts:
+            return []
 
-        prompt_token_ids_batch = [self._prompt_to_token_ids(prompt) for prompt in prompts]
-        base_states = [
-            self._make_sequence(self.base_engine, prompt_token_ids, sp)
-            for prompt_token_ids, sp in zip(prompt_token_ids_batch, sampling_params)
-        ]
-        draft_states = [
-            self._make_sequence(self.draft_engine, prompt_token_ids, sp)
-            for prompt_token_ids, sp in zip(prompt_token_ids_batch, sampling_params)
-        ]
+        requests: list[_BatchRequestState] = []
+        pbar = tqdm(total=len(prompts), desc="Speculative batch decoding", dynamic_ncols=True) if use_tqdm else None
+        reported_finished: set[int] = set()
 
-        proposed_tokens = [0, 0]
-        accepted_tokens = [0, 0]
-        resync_count = [0, 0]
-        finished = [False, False]
-        reported_finished = [False, False]
-        pbar = tqdm(total=2, desc="Speculative batch decoding", dynamic_ncols=True) if use_tqdm else None
-
-        def _mark_finished(idx: int):
-            finished[idx] = True
-            if pbar is not None and not reported_finished[idx]:
-                pbar.update(1)
-            reported_finished[idx] = True
+        def _flush_progress():
+            if pbar is None:
+                return
+            for request in requests:
+                if request.output_ready and request.request_id not in reported_finished:
+                    pbar.update(1)
+                    reported_finished.add(request.request_id)
 
         try:
-            _ = self._next_logits_batch(self.base_engine, base_states)
+            requests = self._prepare_batch_requests(prompts, sampling_params)
+            _flush_progress()
 
             while True:
-                for idx, state in enumerate(base_states):
-                    if finished[idx]:
-                        continue
-                    remaining = sampling_params[idx].max_tokens - state.seq.num_completion_tokens
-                    if remaining <= 0:
-                        _mark_finished(idx)
-
-                if all(finished):
+                if all(request.is_finished for request in requests):
                     break
 
-                active_indices = [idx for idx in range(2) if not finished[idx]]
-                active_draft_states = [draft_states[idx] for idx in active_indices]
-                max_steps_per_state = [
-                    min(
-                        self.draft_length,
-                        sampling_params[idx].max_tokens - base_states[idx].seq.num_completion_tokens,
-                    )
-                    for idx in active_indices
-                ]
-                proposal_token_ids_batch = self._propose_batch_with_draft(
-                    active_draft_states,
-                    max_steps_per_state,
-                )
+                verify_batch = self._select_verify_batch(requests)
+                if verify_batch:
+                    # verify_ready 优先级高于 drafting：
+                    # 一旦某条 request 已经拿到了 proposal，尽快提交到 base，
+                    # 能更早释放它的“本轮挂起状态”，避免 proposal 在 request 池里堆积。
+                    self._run_verify_batch(verify_batch)
+                else:
+                    drafting_requests = self._drafting_requests(requests)
+                    if not drafting_requests:
+                        raise RuntimeError("No drafting or verify-ready requests are available in batch state machine.")
+                    # V5.1 的“异步”体现在 phase 可以不同，但 GPU launch 仍保持串行：
+                    # 每次只推进一个 batched draft step，让已经 verify_ready 的 request
+                    # 能在下一轮立即被挑出来校验，而不是等整批都凑满 k。
+                    self._draft_one_step(drafting_requests)
 
-                proposal_by_index = {}
-                for local_idx, idx in enumerate(active_indices):
-                    proposal_token_ids = proposal_token_ids_batch[local_idx]
-                    proposal_by_index[idx] = proposal_token_ids
-                    proposed_tokens[idx] += len(proposal_token_ids)
-
-                verify_groups: dict[int, list[int]] = {}
-                for idx in active_indices:
-                    proposal_len = len(proposal_by_index[idx])
-                    if proposal_len > 0:
-                        verify_groups.setdefault(proposal_len, []).append(idx)
-
-                if not verify_groups:
-                    break
-
-                for group_indices in verify_groups.values():
-                    next_states, accepted_counts, fallback_token_ids = self._verify_batch_with_base(
-                        [base_states[idx] for idx in group_indices],
-                        [proposal_by_index[idx] for idx in group_indices],
-                    )
-                    for local_idx, idx in enumerate(group_indices):
-                        accepted_count = accepted_counts[local_idx]
-                        fallback_token_id = fallback_token_ids[local_idx]
-                        proposal_token_ids = proposal_by_index[idx]
-                        base_states[idx] = next_states[local_idx]
-                        accepted_tokens[idx] += accepted_count
-
-                        if self._sequence_finished(
-                            base_states[idx].seq,
-                            base_states[idx].seq.last_token,
-                            self.base_engine.scheduler.eos,
-                        ):
-                            _mark_finished(idx)
-                            continue
-
-                        if fallback_token_id is None:
-                            continue
-
-                        is_partial_accept = accepted_count != len(proposal_token_ids)
-                        if is_partial_accept:
-                            resync_count[idx] += 1
-                            target_len = base_states[idx].seq.num_tokens - 1
-                            if target_len < draft_states[idx].seq.num_tokens:
-                                self._truncate_sequence(self.draft_engine, draft_states[idx], target_len)
-                            draft_states[idx].seq.append_token(fallback_token_id)
-                        else:
-                            draft_states[idx].seq.append_token(fallback_token_id)
+                _flush_progress()
 
             return [
-                self._build_output(
-                    base_states[idx],
-                    accepted_tokens[idx],
-                    proposed_tokens[idx],
-                    resync_count[idx],
-                )
-                for idx in range(2)
+                self._build_request_output(request)
+                for request in sorted(requests, key=lambda request: request.request_id)
             ]
         finally:
             if pbar is not None:
                 pbar.close()
-            for state in base_states:
-                self._free_sequence(self.base_engine, state)
-            for state in draft_states:
-                self._free_sequence(self.draft_engine, state)
+            self._free_batch_requests(requests)
 
     def _generate_one(
         self,
