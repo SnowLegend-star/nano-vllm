@@ -312,20 +312,41 @@ def store_kvcache(
 ):
     """
     纯 PyTorch 实现显存写入。
+
+    V4.2 改造 — CUDA Graph 友好版本：
+      旧实现用 `slot_mapping[mask]` boolean mask + `valid_slots.numel() > 0`
+      host-side 分支，会触发 `cudaErrorStreamCaptureUnsupported`，让 draft
+      engine 的 Graph capture 永远失败（fallback 到 eager）。
+
+      这里改成「无数据相关分支」的写法：
+        - 把 slot=-1 的位置映射到 slot=0（dummy slot）
+        - 对那些位置，用 cache 里原本的值替代要写入的 key/value，
+          使得 scatter 出来的结果对 slot 0 是 no-op
+        - 整个流程都是 element-wise op + 确定形状的 index put，
+          全部可被 CUDA Graph 捕获
+      正确性：slot_mapping 里合法值都 >= 0 时行为与旧版完全一致；
+      遇到 -1 时旧版跳过，新版把同一位置读出再写回，等价 no-op。
     """
-    N, num_heads, head_dim = key.shape
-    
-    # k_cache 在这里传入时通常是 [Blocks, BlockSize, H, D]
-    # 我们将其视为扁平视图 [Total_Slots, H, D] 以便索引
+    _, num_heads, head_dim = key.shape
     k_cache_flat = k_cache.view(-1, num_heads, head_dim)
     v_cache_flat = v_cache.view(-1, num_heads, head_dim)
-    
-    mask = slot_mapping >= 0
-    valid_slots = slot_mapping[mask].long()
-    
-    if valid_slots.numel() > 0:
-        k_cache_flat[valid_slots] = key[mask].to(k_cache_flat.dtype)
-        v_cache_flat[valid_slots] = value[mask].to(v_cache_flat.dtype)
+
+    # slot=-1 -> 映射到 0（任意合法 slot 都行，后面会用 where 还原）
+    valid = slot_mapping >= 0
+    safe_slots = torch.where(
+        valid, slot_mapping, torch.zeros_like(slot_mapping)
+    ).long()
+
+    # 对 slot=-1 的位置：把待写入的值替换成 cache 里原本的值 → 写回等于不变
+    mask = valid.view(-1, 1, 1)
+    existing_k = k_cache_flat.index_select(0, safe_slots)
+    existing_v = v_cache_flat.index_select(0, safe_slots)
+    new_k = torch.where(mask, key.to(k_cache_flat.dtype), existing_k)
+    new_v = torch.where(mask, value.to(v_cache_flat.dtype), existing_v)
+
+    # index_copy_ 在固定 shape 的 safe_slots 上是 graph-friendly 的 scatter
+    k_cache_flat.index_copy_(0, safe_slots, new_k)
+    v_cache_flat.index_copy_(0, safe_slots, new_v)
 
 # ------------------------------------------------------------
 # Optimized Fallback: Prefill (SDPA)

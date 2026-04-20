@@ -48,10 +48,16 @@ class ModelRunner:
                 print("[WARNING] FlashAttention is unavailable, skipping CUDA Graph and falling back to eager mode.")
                 self.enforce_eager = True
             else:
+                # V4.2: 捕获前先 empty_cache 把碎片还给 driver，避免 capture 过程中
+                # 触发新的 cudaMalloc 从而引发 `cudaErrorStreamCaptureInvalidated`。
+                # 在 draft engine 这种“加载完就快贴满显存”的场景尤为重要。
+                torch.cuda.empty_cache()
                 try:
                     self.capture_cudagraph()  # 捕获CUDA图，提升Decode阶段吞吐量
                 except RuntimeError as exc:
-                    # 纯 PyTorch fallback 的 KV 写入包含动态图索引，在某些环境下无法被 CUDA Graph 捕获。
+                    # V4.2 之前 store_kvcache 用了 boolean mask 索引，会触发
+                    # cudaErrorStreamCaptureUnsupported；V4.2 已重写成 graph-friendly
+                    # 版本。这里保留 graceful fallback 以防未来新路径再出现不可捕获的 op。
                     print(f"[WARNING] CUDA Graph capture failed, falling back to eager mode: {exc}")
                     self.enforce_eager = True
 
@@ -514,8 +520,14 @@ class ModelRunner:
     # 1. 读取配置（模型配置/最大序列数/块大小等）
         config = self.config
         hf_config = config.hf_config  # HuggingFace模型配置（比如hidden_size）
-        # 确定最大batch size：取配置的最大序列数和512的较小值（避免显存溢出）
-        max_bs = min(self.config.max_num_seqs, 512)
+        # 确定最大batch size：取配置的最大序列数和512的较小值（避免显存溢出）。
+        # V4.2 起额外支持 cudagraph_max_bs 显式封顶：在 speculative decoding 的
+        # draft engine 这种只跑 bs=1 的场景里设成 1，graph pool 显存 / 捕获耗时
+        # 都能降到最小，避免捕获一堆永远用不到的大 bs 图。
+        cap = self.config.max_num_seqs
+        if config.cudagraph_max_bs is not None:
+            cap = min(cap, config.cudagraph_max_bs)
+        max_bs = min(cap, 512)
         # 计算单序列最大块数：(最大模型长度 + 块大小 -1) // 块大小 → 向上取整（比如max_model_len=1024，block_size=256 → 4）
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 
@@ -531,8 +543,10 @@ class ModelRunner:
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
         # 3. 定义要捕获的batch size列表（覆盖常用的bs，兼顾性能和显存）
-        # 先小批量（1/2/4/8），再按16步长到大批量（16,32,...,max_bs）
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # 先小批量（1/2/4/8），再按16步长到大批量（16,32,...,max_bs），
+        # 然后按 max_bs 封顶，确保 cudagraph_max_bs=1 时只捕获 [1]。
+        candidate_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [bs for bs in candidate_bs if bs <= max_bs]
         self.graphs = {}  # 保存不同bs对应的CUDA Graph：key=bs，value=graph
         self.graph_pool = None  # CUDA Graph池（复用显存，减少内存碎片）
 

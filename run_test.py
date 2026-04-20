@@ -57,11 +57,20 @@ BASE_KWARGS = {
 }
 
 DRAFT_KWARGS = {
-    "enforce_eager": True,
+    # V4.2: 给 draft engine 打开 CUDA Graph。
+    # - speculative decoding 里 draft 永远是 bs=1 decode，吃 Graph 最划算。
+    # - 通过 cudagraph_max_bs=1 把 graph 池只捕获一张 [bs=1] 的图，
+    #   显存开销和捕获时间都压到最小，也避开了大 bs 无意义捕获。
+    # - Case C (全接受 + bonus) 走 prefix-cache prefill，不经 Graph，行为保持不变。
+    # - kvcache_memory_budget 从 1 压到 0.5：因为 base 已经吃掉大半显存，
+    #   graph capture 还要 ~100-200MB activation workspace，budget=1 时 OOM
+    #   会直接 fallback 到 eager。实测 0.5GB≈16 blocks 足够单序列 max_model_len=1024。
+    "enforce_eager": False,
+    "cudagraph_max_bs": 1,
     "tensor_parallel_size": 1,
     "dtype": "float16",
     "max_model_len": 1024,
-    "kvcache_memory_budget": 1,
+    "kvcache_memory_budget": 0.5,
 }
 
 

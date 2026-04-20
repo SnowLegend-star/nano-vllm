@@ -68,8 +68,9 @@ def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
 | V2 | 去 replay + adopt verify_state | 削掉最重的 base 额外开销 | 已被替代 |
 | V3 | 增量状态复用 | verify / resync 都走增量 fork，partial block 也能复用 | 已被替代 |
 | V4.0 | fused q0 + verify | 每轮 base 只做一次 prefill(k+1)，全接受自动吃 bonus | 已被替代 |
-| V4.1 | 消灭 Case C dummy decode | draft 侧多 uncached token 走 prefix-cache prefill，一次算完 `[d_k, bonus]` | **当前版本** |
-| V4.2+ 目标 | Python / CPU-GPU 同步清理 | `verify_draft_tokens` tensor 化、fork 循环压成向量化 | 规划中 |
+| V4.1 | 消灭 Case C dummy decode | draft 侧多 uncached token 走 prefix-cache prefill，一次算完 `[d_k, bonus]` | 已被替代 |
+| V4.2 | draft CUDA Graph + graph-friendly `store_kvcache` | 重写 `store_kvcache` 去掉 host sync，顺势打通 draft bs=1 CUDA Graph | **当前版本** |
+| V5+ 目标 | Batch SD | 多 request 共享 base verify，真正把绝对吞吐拉起来 | 规划中 |
 
 后面每一节会按「目标 / 主要改动 / 时序图（可选）/ 性能观察 / 剩余问题」五个维度讲。
 
@@ -804,6 +805,288 @@ $$
 
 因此 nano-vllm 单请求 speculative decoding 的工程优化线，在 CUDA Graph 落地之后就基本告一段落了。
 
+## 10. 长期路线：从单 seq 到 batch SD
+
+§9 得出了一个有点尴尬的结论——**仓库内工程 micro-opt 的天花板就在 0.86x 左右**，想继续往上必须做结构性改动。这一节记录我们对「往哪走」的一次诚实权衡，并给出 V5 batch SD 的路线图。
+
+### 10.1 单 seq SD 为什么永远「差了点意思」
+
+一个被前九章反复忽视的事实：**bs=1 场景下 GPU 本来就没吃满**。speculative decoding 在单请求下优化的其实是「GPU 空跑的那一部分」，不是 GPU 的"算力总量"。
+
+粗估 4090D (fp16) 下两个模型的 GPU 利用率：
+
+| 场景 | 每 token 延迟 | GPU 利用率 | 吞吐 |
+|---|---|---|---|
+| base 4B decode, bs=1  | ~50 ms | **~8-15%**   | ~20 tok/s  |
+| base 4B decode, bs=32 | ~80 ms | **~70-90%**  | **~400 tok/s** |
+| draft 0.6B decode, bs=1  | ~12 ms | **~3-5%**   | ~80 tok/s  |
+| draft 0.6B decode, bs=32 | ~18 ms | **~40-60%** | ~1800 tok/s |
+
+bs=1 时 `c = T_draft / T_base ≈ 0.24` 看起来很小，其实是因为**两边都没吃满 GPU**，小模型反而 launch overhead 占比更高。一旦进入 batch 模式，情况会彻底翻转。
+
+### 10.2 Batch SD 的数字优势
+
+batch 下 `c ≈ 0.25`（基本不变，都在吃 tensor core），所以 Leviathan 公式给出的 **speedup 比例仍然 1.5x 左右**——但"基数"完全不同：
+
+| 指标 | 单 seq SD (V4.1) | Batch SD (bs=32, 估算) |
+|---|---|---|
+| speedup vs baseline | 0.82x | **~1.5x** |
+| 绝对吞吐 | ~18 tok/s | **~600 tok/s** |
+| 相对 bs=1 baseline serving | 0.8x | **~30x** |
+
+关键洞察：**batch SD 的"比例收益"和单 seq SD 差不多，但把基数拉高 20-30x**。这才是 production serving 真正关心的数字。之前我们跟 "1.0x" 较劲一定程度上是在错误的战场。
+
+### 10.3 换 base / 换 draft：硬件和条件都卡
+
+这两条路在当前条件下都不太划算：
+
+**Qwen3-8B on 4090D（24GB）的显存预算估算：**
+
+| 项 | 估算 |
+|---|---|
+| 权重 (fp16) | ~16.0 GB |
+| activation / workspace | ~1.5 GB |
+| 系统 + PyTorch overhead | ~1.5 GB |
+| 仅 base 已占 | **~19 GB** |
+| draft 0.6B 权重 | ~1.2 GB |
+| 双模型权重 + 系统 | **~20.2 GB** |
+| 留给双份 KV cache | **~3.5-4 GB** |
+
+3.5 GB 的 KV cache 在 `max_model_len=1024` 下大概**只能存 100-200 个 block**，prompt 稍长或者 batch 起来就容易抖。**4090D 跑 Qwen3-8B base 在极限边缘，不推荐**。
+
+退一步换 `Qwen3-7B`（权重 ~14 GB）是稳的，但 `c` 也只从 0.24 推到 ~0.15，**理论上限从 1.5x 提到 1.7x，不是数量级变化**。
+
+**换 draft（EAGLE / Medusa / 蒸馏）** 能把 α 从 ~0.72 推到 0.85+，但需要训练、需要数据、需要 baseline 的 logits 对齐——**已经不是纯工程问题**，暂时不具备条件。
+
+### 10.4 Batch SD 的工程可行性拆解
+
+batch SD 不需要蒸馏、不需要换硬件、不需要训练，**是当前条件下唯一能让 speedup 和绝对吞吐双双拉起来的路径**。按真实改动拆一下：
+
+| 改动 | 工作量 | 复杂度 | 备注 |
+|---|---|---|---|
+| `_propose_with_draft` 改成 batch | 中 | 低 | nano-vllm 的 `prepare_decode` 本来就支持 batch，只需改 `SpeculativeLLM` 的串行循环 |
+| `_verify_with_base` 改成 batch | 中 | 低 | `prepare_prefill` 底层支持 `cu_seqlens_q` 变长，fused `prefill(k+1)` 可以横向拼 |
+| 每个 request 的**并发状态机** | **大** | **高** | 最难的一块：每轮 batch 构成不同（有的在 propose / 有的 verify 完 / 有的 Case C 要 prefix-prefill(2)） |
+| `BlockManager` 区分 base/draft 两套 block pool | 中 | 中 | 现在两个 engine 各有自己的 block_manager，batch 下需要细化 |
+| 和原生 `Scheduler` 融合 | 大 | 中高 | production 级必须做；MVP 阶段可以先绕过 |
+
+**真正的难点只有第三项**——把单请求的 while 循环翻转成多请求并发状态机。其他几项底层都是现成的。
+
+### 10.5 长期路线图
+
+给一个从"已完成"往"远期"排的 roadmap，每个 milestone 都有明确的完成标志。
+
+#### V4.2（可选，单 seq 工程收官）：draft CUDA Graph
+
+- 目标：把单 seq speedup 从 0.82x → ~0.86x
+- 改动面：`capture_cudagraph()` 加 `graph_bs` 参数，`SpeculativeLLM.draft_kwargs` 支持 `enforce_eager=False`，裁剪到 `graph_bs=[1]` 防 OOM
+- 价值：**作为 batch SD 的铺路**——CUDA Graph 在 batch 下也能吃到（draft batch decode shape 固定）
+- 不是非做不可，可以直接跳到 V5
+
+#### V5.0（batch MVP）：固定 batch=2
+
+- 目标：支持固定 `batch=2` 的 speculative decoding
+- 改动面：不碰原生 Scheduler，在 `SpeculativeLLM` 外面套一层 `_generate_batch`
+- 实现一个**最小同步状态机**：两个 request 同步进 propose、同步进 verify，不同步就等（有 bubble，但代码简单）
+- benchmark 目标：batch=2 下 speedup 和单 seq 相当（~0.8x），绝对吞吐 ~1.8x
+
+#### V5.1（任意 batch + 异步状态机）
+
+- 目标：支持任意 batch size，每个 request 独立推进
+- `_SequenceState` 扩展为可多元；每轮 dynamic batching：把当前状态兼容的 request 打成 batch
+- 比如同时有 3 个要 propose、2 个要 verify、1 个 Case C 要 prefix-prefill(2)，在合适的轮次里各自 batch 调度
+- benchmark 目标：bs=8-16 下 speedup ~1.3-1.5x，绝对吞吐 ~10-20x bs=1 baseline
+- 这是从 MVP 升级到「可用系统」的关键一步
+
+#### V5.2（和原生 Scheduler 融合）
+
+- 目标：prefill / decode / speculative 都能在同一个 Scheduler 下调度
+- 改动面：`Scheduler` 扩展支持 `SpeculativeSequence` 类型；`BlockManager` 细化成 base/draft 双池
+- 做到这一步，nano-vllm 就真的成了「带 SD 的 production inference engine 的开源教学版」，**学习价值远大于 speedup 本身**
+
+### 10.6 决策
+
+综合 §9 和 §10：
+
+- 短期（选做）：**V4.2 draft CUDA Graph**——最后一波单 seq 工程收益，顺带为 V5 铺基建
+- 中期（值得投入）：**V5.0 → V5.1 batch SD**——真正能把 speedup × 基数都做起来的路径，也是学习 production SD 的必经之路
+- 不做：继续换 base / 蒸馏 draft / 上量化——不是纯工程能解决的，且硬件/条件不支持
+
+§10 的意义不是给出确定的下一步，而是**明确"单 seq 工程线到此为止"这个共识**，后面任何继续投入都应该有意识地偏向 batch SD 这条结构性路线。
+
+## 11. V4.2：draft CUDA Graph（当前版本，并重估 §9 的理论上限）
+
+> **TL;DR**：§9 原本预期 CUDA Graph 只能再挤 +2~4%，V4.2 真正落地后 **k=2 从 0.78x → 1.28x、k=3 从 0.72x → 1.48x**，首次稳定突破 1.0x。
+> 收益远超预期的根因是 §9 低估了 `store_kvcache` 的 **per-layer GPU→CPU 同步成本**——这条路径每个 attention layer 都会触发一次 `cudaStreamSynchronize`，在 bs=1 的 draft decode 里占比惊人。CUDA Graph 能捕获的前提是重写 `store_kvcache` 去掉 host sync，这个"前置清障"本身就带来了单独的大头收益。
+
+### 11.1 目标
+
+让 draft engine 的 bs=1 decode 路径走上 CUDA Graph：
+
+- `capture_cudagraph()` 支持按需裁剪 `graph_bs` 列表（只捕获 `[1]`，避免冗余 & OOM）
+- `SpeculativeLLM` 的 draft engine 支持 `enforce_eager=False`
+- Graph capture 失败时 graceful fallback 到 eager（保持 V4.1 行为）
+
+### 11.2 前置问题：`store_kvcache` 阻塞 Graph capture
+
+第一次尝试启用 draft CUDA Graph 时，capture 直接在 capture_end 阶段报错：
+
+```
+CUDA error: operation not permitted when stream is capturing
+cudaErrorStreamCaptureUnsupported
+  at nanovllm/layers/attention.py: valid_slots = slot_mapping[mask].long()
+```
+
+定位根因——`nanovllm/layers/attention.py::store_kvcache` 的原始实现：
+
+```python
+mask = slot_mapping >= 0
+valid_slots = slot_mapping[mask].long()    # boolean mask indexing → 隐式 GPU→CPU 同步
+if valid_slots.numel() > 0:                # host-side branch
+    k_cache_flat[valid_slots] = key[mask].to(k_cache_flat.dtype)
+    v_cache_flat[valid_slots] = value[mask].to(v_cache_flat.dtype)
+```
+
+这里两个问题：
+
+1. `slot_mapping[mask]` 是 boolean mask indexing，会触发 `cudaStreamSynchronize` —— 因为 PyTorch 必须知道 mask 里有多少 True 才能分配输出 tensor 的 shape
+2. `valid_slots.numel() > 0` 是 host-side 分支——读 tensor 元素数量本身也是同步点
+
+这两点都在 CUDA Graph capture 白名单之外，直接触发 `cudaErrorStreamCaptureUnsupported`。
+
+### 11.3 核心改动
+
+#### 11.3.1 `store_kvcache` 改写成 graph-friendly 版本
+
+`nanovllm/layers/attention.py`：
+
+```python
+def store_kvcache(key, value, k_cache, v_cache, slot_mapping):
+    _, num_heads, head_dim = key.shape
+    k_cache_flat = k_cache.view(-1, num_heads, head_dim)
+    v_cache_flat = v_cache.view(-1, num_heads, head_dim)
+
+    # slot=-1 -> 映射到 slot 0（任意合法 slot 即可）
+    valid = slot_mapping >= 0
+    safe_slots = torch.where(
+        valid, slot_mapping, torch.zeros_like(slot_mapping)
+    ).long()
+
+    # 对 slot=-1 的位置：先读 cache 里原值，再 where 回退 → 写入变 no-op
+    mask = valid.view(-1, 1, 1)
+    existing_k = k_cache_flat.index_select(0, safe_slots)
+    existing_v = v_cache_flat.index_select(0, safe_slots)
+    new_k = torch.where(mask, key.to(k_cache_flat.dtype), existing_k)
+    new_v = torch.where(mask, value.to(v_cache_flat.dtype), existing_v)
+
+    k_cache_flat.index_copy_(0, safe_slots, new_k)
+    v_cache_flat.index_copy_(0, safe_slots, new_v)
+```
+
+整个 function 变成「无 data-dependent 分支、全 element-wise / fixed-shape index op」，CUDA Graph 捕获没有障碍。
+
+正确性：
+- 所有 `slot_mapping >= 0` 的位置：`new_k == key`，`index_copy_` 行为等价于原版 `k_cache_flat[slot] = key`
+- 所有 `slot_mapping == -1` 的位置：`new_k == existing_k[0]`，写回 slot 0 的内容到 slot 0，对 cache 无影响
+- **警告**：只有当 `slot_mapping == -1` 的位置和 `slot_mapping == 0` 的位置**不同时出现**才是严格幂等。当前 nano-vllm 的 `prepare_decode` 永远给出合法 slot（无 -1），`prepare_prefill` 也全是正值，所以这个约束天然成立；唯一会出现 -1 的地方是 Graph replay 时 `graph_vars["slot_mapping"].fill_(-1)` 填充的 `[bs:max_bs]` 区域，但 graph 内部 kernel 压根不读这块，不影响结果
+
+#### 11.3.2 `cudagraph_max_bs` 配置项
+
+`nanovllm/config.py`：
+
+```python
+@dataclass
+class Config:
+    ...
+    cudagraph_max_bs: int | None = None  # None = 沿用 max_num_seqs
+```
+
+`nanovllm/engine/model_runner.py::capture_cudagraph()` 里按这个 cap 裁剪：
+
+```python
+cap = self.config.max_num_seqs
+if config.cudagraph_max_bs is not None:
+    cap = min(cap, config.cudagraph_max_bs)
+max_bs = min(cap, 512)
+...
+candidate_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+self.graph_bs = [bs for bs in candidate_bs if bs <= max_bs]
+```
+
+设 `cudagraph_max_bs=1` 就只捕获一张 `bs=1` 的图。speculative decoding 的 draft engine 永远是 bs=1 decode，这是恰好匹配的配置。
+
+另外加了一行 capture 前 `torch.cuda.empty_cache()`，避免 private pool 分配时触发新的 cudaMalloc 引发 `cudaErrorStreamCaptureInvalidated`。
+
+#### 11.3.3 `run_test.py` 的 draft_kwargs 打开
+
+```python
+DRAFT_KWARGS = {
+    "enforce_eager": False,
+    "cudagraph_max_bs": 1,
+    ...
+    "kvcache_memory_budget": 0.5,  # 从 1 压到 0.5，给 graph capture 留 activation workspace
+}
+```
+
+### 11.4 实测结果（同一 prompt suite，k ∈ {2, 3}）
+
+| prompt         | base V4.1 | base V4.2 | k=2 V4.1 | k=2 V4.2 | **V4.2 k=2 speedup** | k=3 V4.1 | k=3 V4.2 | **V4.2 k=3 speedup** |
+|---|---|---|---|---|---|---|---|---|
+| think_long     | 21.55     | **24.43** | 17.77    | **32.92** | **1.35x** | 16.39 | **40.81** | **1.67x** |
+| short_qa       | 24.92     | **28.32** | 19.90    | **36.13** | **1.28x** | 17.24 | **38.99** | **1.38x** |
+| factual_list   | 24.93     | **28.07** | 17.79    | **34.01** | **1.21x** | 15.95 | **38.72** | **1.38x** |
+| template_code  | 24.98     | **28.32** | 19.37    | **36.18** | **1.28x** | 18.33 | **42.81** | **1.51x** |
+| casual_chat    | 23.52     | **28.47** | 17.92    | **34.41** | **1.21x** | 16.99 | **40.80** | **1.43x** |
+
+> 单位：tok/s。base / speedup 都按同一版本内的 baseline tok/s 算。
+> V4.2 启用后，baseline 本身 **+12% 左右**（eager 模式也少了 `store_kvcache` 的 host sync），spec k=2 平均 **1.27x**，spec k=3 平均 **1.47x**。
+
+三个反直觉现象：
+
+1. **baseline 也变快了**：V4.2 只给 draft engine 开了 Graph，但 baseline（只加载 base 4B、`enforce_eager=True`）的 tok/s 也从 ~24 涨到 ~28。
+   - 根因：`store_kvcache` 的改写同样作用在 base 的 eager decode 路径上，每层 attention 少一次 host sync。4B 有 36 层，一轮 decode 省 36 次同步，在 bs=1 decode 下这个开销占比不低
+2. **k=3 反超 k=2**：V4.0/V4.1 里 k=3 永远更慢（draft 成本 > acceptance 带来的收益），V4.2 里 k=3 全面领先。
+   - 根因：Graph 把 draft 单次 forward 的开销降到极低，draft 成本下降后更长的 draft 链重新变得划算（每轮能拿更多 bonus token）
+3. **实测 speedup 远超 §9.4.3 的 +2~4% 预测**：
+   - 1.28x / 0.78x ≈ **+64%**；1.48x / 0.72x ≈ **+105%**
+   - §9.4.3 的建模只考虑了 Graph 替代 kernel launch 的固定开销，**完全漏掉了 `store_kvcache` 每层都在做的 GPU→CPU 同步**
+
+### 11.5 §9 理论上限的修正
+
+§9 中对当前实现的单 seq speedup 天花板给了两个估计：
+
+- **理论上限** `(1 - α^(k+1)) / ((1 - α)(kc + 1)) ≈ 1.5x`
+- **可实现上限** `~1.2-1.3x`，工程 micro-opt 的极限是 `~0.86x`
+
+V4.2 实测 **k=3 平均 1.47x**，已经非常接近理论上限 1.5x。这意味着：
+
+1. 理论公式里的 `c = T_draft / T_base` 本来是"纯 GPU kernel 时间比"，§9.2 用端到端延迟估了 `c ≈ 0.24`。**但这个端到端延迟里混着大量非 kernel 的 host sync / Python dispatch overhead**，用来代入理论公式是**高估了 c**
+2. V4.2 打通 Graph 后，draft 这边基本只剩纯 kernel 时间，**真实的 c 降到了接近 0.1 左右**。代入公式 `(1 - 0.72^4) / ((1 - 0.72)(3×0.1 + 1)) ≈ 1.77x`——**所以 1.47x 并不是奇迹，而是修正 c 之后公式自己给出的结果**
+3. §9.5 里说"继续 micro-opt 最多到 0.86x"这个结论基于错误的 c 估计，**现在应作废**
+
+一句话修正：**"工程线到此为止"的判断在方向上是对的（结构改动（batch SD / 换 base）才是未来），但 V4.2 在单 seq 路线上比 §9 预测的多挤出了一整倍的收益；`store_kvcache` 的 host sync 是之前所有版本都共享但没被识别的隐形 overhead。**
+
+### 11.6 V4.2 剩余 overhead 与下一步
+
+即便 k=3 已经冲到 1.47x，还差 1.5x 理论上限一点点，主要来自：
+
+- `verify_draft_tokens` 里的 `.tolist()` / `.item()` 同步（§9.3 里 P1 方向的遗留，~50-200 μs/轮）
+- `_fork_sequence_from_state` 的 Python 循环（逐 block 复制）
+- base 端的 `prefill(k+1)` 没走 Graph（§9.4 方案 C，ROI 低）
+
+这些优化的绝对收益量级在 +3~5%，比起 V4.2 这次的 +60~100% 明显是量级更小的"清扫"。**是否还要继续单 seq 优化，取决于是否愿意为每 3% 再投入代码**；按 §10 的结论，更值得的路是直接进 V5 batch SD。
+
+V4.2 的额外价值是**为 V5 铺路**：draft batch decode shape 也固定（`[bs, 1, num_heads, head_dim]`），Graph 机制在 batch 下无痛扩展，`store_kvcache` 已经 graph-friendly。
+
+### 11.7 正确性 checklist
+
+- [x] `graph_bs = [1]`（`cudagraph_max_bs=1` 生效）
+- [x] capture 前 `empty_cache()` 成功，enforce_eager 保持 False
+- [x] 整个 prompt suite 的输出前 64 token 与 V4.1 eager 模式逐 token 一致（greedy 下应完全一致）
+- [x] acceptance rate / accepted / proposed 数字 V4.1 → V4.2 不变（只动了执行路径，没动算法）
+- [x] Graph capture 失败时 `[WARNING]` fallback 生效（测试：临时改 `store_kvcache` 加一次 `.item()` 模拟失败）
+- [x] `run_test.py` 的 baseline 同样受益（eager 路径也走新版 `store_kvcache`）
+
 ## 附录 A：已解决的历史问题
 
 ### A.1 accepted draft token 没同步回 `base_state` 的 KV cache
@@ -863,19 +1146,25 @@ $$
 
 ## 附录 D：下一步计划
 
-（此清单已被 §9 的结论取代，保留历史视角。）
+（此清单已被 §10 + §11 的结论更新，保留早期视角做对比。）
 
-之前的工程路线（V2 → V3 → V4.0 → V4.1）已经走完最划算的那段，继续往下按照 §9.5 分两档：
+**已落地 (V4.2)**
 
-**工程档（仓库内，最后一波）**
+- 重写 `store_kvcache` 为 graph-friendly 版本
+- draft engine 启用 CUDA Graph (`cudagraph_max_bs=1`)
+- 顺带让 baseline eager 路径也少每层一次 host sync
+- **结果**：k=3 从 0.72x → 1.47x 平均，首次稳定突破 1.0x
 
-1. **V4.2：启用 draft CUDA Graph**（§9.4.5 方案 A），预期 +2~4%，把 speedup 从 `0.82x` 推到 `~0.86x`
-2. pinned buffer 复用（可选）、sampling 路径下的 bonus token（拒绝采样）— 都不影响 speedup
+**单 seq 路线剩余可选工程（小 ROI，+3~5%）**
 
-**结构档（需要加新东西）**
+1. `verify_draft_tokens` tensor 化（§9.3 P1 方向），消除 `.tolist()` 同步
+2. `_fork_sequence_from_state` 的 Python 循环向量化
+3. base 端 `prefill(k+1)` 的 varlen graph（§9.4 方案 C）—— 风险 + 复杂度都高
 
-1. **换更大 base（Qwen3-7B/8B）**：理论上限 `1.5x → 2.2x`，是当前最直接的 speedup 来源
-2. **batch SD**：和原生 `Scheduler` 融合，多 request 共享 base verify 前向
-3. **换 draft（EAGLE / MTP / 蒸馏）**：需要训练，已经不属于纯工程问题
-   - 和 `Scheduler` 融合
-   - `ModelCacheState` 抽象
+综合 §10 的结论，这些 micro-opt **不建议再继续做**。
+
+**结构档（真正有量级收益的方向）**
+
+1. **V5 batch SD**：按 §10.5 的 V5.0 → V5.1 → V5.2 roadmap 推进；绝对吞吐有望到 bs=1 baseline 的 20-30x
+2. **换更大 base（Qwen3-7B）**：在 4090D 上是可行的（§10.3），理论上限从 1.5x 推到 1.7x，配合 batch SD 是乘法关系
+3. **换 draft（EAGLE / MTP / 蒸馏）**：需要训练，暂不具备条件
